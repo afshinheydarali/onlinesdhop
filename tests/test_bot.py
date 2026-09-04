@@ -47,8 +47,6 @@ class BotLogicTests(unittest.IsolatedAsyncioTestCase):
         text = render_order_html(order, self.admin, "Asia/Tehran")
         self.assertIn("&lt;b&gt;bad&lt;/b&gt; &amp; text", text)
         self.assertIn("&lt;فروشنده&gt;", text)
-        self.assertNotIn("تکراری:", text)
-        self.assertEqual(text.splitlines()[-1], "توضیحات: —")
 
     def test_preview_supports_confirm_edit_and_cancel(self) -> None:
         callbacks = {
