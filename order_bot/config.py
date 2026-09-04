@@ -2,7 +2,25 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+
+def load_env_file(path: str = ".env") -> None:
+    env_file = Path(path)
+    if not env_file.is_file():
+        return
+    for number, raw_line in enumerate(env_file.read_text(encoding="utf-8-sig").splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, separator, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if not separator or not key:
+            raise ValueError(f"Invalid .env line {number}")
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,7 +34,9 @@ class Config:
     log_level: str = "INFO"
 
     @classmethod
-    def from_env(cls) -> "Config":
+    def from_env(cls, env_file: str | None = ".env") -> "Config":
+        if env_file:
+            load_env_file(env_file)
         missing = [name for name in ("BOT_TOKEN", "OWNER_TELEGRAM_ID", "ORDERS_CHANNEL_ID") if not os.getenv(name)]
         if missing:
             raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
@@ -42,4 +62,3 @@ class Config:
             app_timezone=timezone,
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         )
-

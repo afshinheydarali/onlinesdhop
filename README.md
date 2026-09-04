@@ -51,9 +51,6 @@ PowerShell:
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-Get-Content .env | ForEach-Object {
-    if ($_ -match '^([^#=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process') }
-}
 python -m order_bot
 ```
 
@@ -63,9 +60,10 @@ Linux/macOS:
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
-set -a; . ./.env; set +a
 python -m order_bot
 ```
+
+برنامه فایل `.env` موجود در پوشه جاری را خودکار می‌خواند. متغیرهایی که از قبل در environment پردازش تنظیم شده‌اند اولویت دارند.
 
 فقط یک instance را روی یک فایل SQLite اجرا کنید.
 
