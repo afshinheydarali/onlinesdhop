@@ -9,6 +9,7 @@ from aiogram.exceptions import TelegramBadRequest
 from order_bot.bot import (
     BACK,
     CANCEL,
+    ChannelAccessError,
     MAX_CAPTION_LENGTH,
     RESTART,
     authorized_admin,
@@ -17,6 +18,7 @@ from order_bot.bot import (
     preview_keyboard,
     publish_order,
     render_order_html,
+    validate_channel,
 )
 from order_bot.config import Config
 from order_bot.database import Database
@@ -109,6 +111,20 @@ class BotLogicTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await authorized_admin(event, state, self.db))
         state.clear.assert_awaited_once()
         event.answer.assert_awaited_once()
+
+    async def test_missing_channel_access_has_actionable_english_message(self) -> None:
+        method = SimpleNamespace(__api_method__="getChat")
+        bot = SimpleNamespace(
+            get_me=AsyncMock(return_value=SimpleNamespace(id=10, username="shopbot")),
+            get_chat=AsyncMock(side_effect=TelegramBadRequest(method, "chat not found")),
+            get_chat_administrators=AsyncMock(),
+        )
+        with self.assertRaises(ChannelAccessError) as raised:
+            await validate_channel(bot, self.config)
+        message = str(raised.exception)
+        self.assertIn("BOT_TOKEN is valid for @shopbot", message)
+        self.assertIn("Manage Channel -> Administrators -> Add Administrator", message)
+        self.assertIn("ORDERS_CHANNEL_ID=-1001234567890", message)
 
     async def test_owner_access_requires_private_chat_and_exact_id(self) -> None:
         state = SimpleNamespace(clear=AsyncMock())

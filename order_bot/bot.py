@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import sys
 import uuid
 from datetime import datetime
 from typing import Any
@@ -10,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType, ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -35,6 +37,10 @@ BACK = "بازگشت"
 RESTART = "شروع مجدد"
 SKIP = "رد کردن"
 MAX_CAPTION_LENGTH = 1024
+
+
+class ChannelAccessError(RuntimeError):
+    pass
 
 
 class OrderForm(StatesGroup):
@@ -470,10 +476,29 @@ def create_router() -> Router:
 
 
 async def validate_channel(bot: Bot, config: Config) -> None:
-    chat, me = await bot.get_chat(config.orders_channel_id), await bot.get_me()
+    me = await bot.get_me()
+    try:
+        chat = await bot.get_chat(config.orders_channel_id)
+        administrators = await bot.get_chat_administrators(config.orders_channel_id)
+    except (TelegramBadRequest, TelegramForbiddenError) as exc:
+        channel_format = "valid (-100...)" if str(config.orders_channel_id).startswith("-100") else "invalid"
+        raise ChannelAccessError(
+            "Telegram channel access check failed.\n\n"
+            "Diagnostics:\n"
+            f"- BOT_TOKEN is valid for @{me.username}.\n"
+            f"- ORDERS_CHANNEL_ID format is {channel_format}.\n"
+            f"- Telegram returned: {exc.message}\n\n"
+            "Fix:\n"
+            "1. Open the private management channel.\n"
+            "2. Go to Manage Channel -> Administrators -> Add Administrator.\n"
+            f"3. Add @{me.username} and enable the Post Messages permission.\n"
+            "4. Copy a channel post link. For https://t.me/c/1234567890/15, "
+            "set ORDERS_CHANNEL_ID=-1001234567890.\n"
+            "5. Restart the bot.\n\n"
+            "If the bot is already an administrator, verify that ORDERS_CHANNEL_ID belongs to that channel."
+        ) from exc
     if chat.type != ChatType.CHANNEL:
         raise RuntimeError("ORDERS_CHANNEL_ID must refer to a channel")
-    administrators = await bot.get_chat_administrators(config.orders_channel_id)
     admin_ids = {member.user.id for member in administrators}
     if config.owner_telegram_id not in admin_ids or me.id not in admin_ids:
         raise RuntimeError("The owner and bot must both be channel administrators")
@@ -501,4 +526,8 @@ async def run() -> None:
 
 
 def main() -> None:
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    except ChannelAccessError as exc:
+        print(exc, file=sys.stderr)
+        raise SystemExit(1) from None
