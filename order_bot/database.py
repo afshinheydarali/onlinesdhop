@@ -135,6 +135,12 @@ class Database:
         cutoff = (now - timedelta(days=self.duplicate_window_days)).isoformat()
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
+            active_admin = connection.execute(
+                "SELECT 1 FROM admins WHERE telegram_id = ? AND is_active = 1", (admin_id,)
+            ).fetchone()
+            if not active_admin:
+                connection.rollback()
+                raise PermissionError("Admin is not active")
             existing = connection.execute("SELECT * FROM orders WHERE draft_token = ?", (draft["draft_token"],)).fetchone()
             if existing:
                 connection.commit()
@@ -174,6 +180,11 @@ class Database:
             params.append(admin_id)
         with closing(self._connect()) as connection:
             row = connection.execute(sql, params).fetchone()
+        return dict(row) if row else None
+
+    def get_order_by_id(self, order_id: int) -> dict[str, Any] | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
         return dict(row) if row else None
 
     def claim_delivery(self, order_id: int) -> bool:

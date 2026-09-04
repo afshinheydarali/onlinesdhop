@@ -39,6 +39,8 @@ class DatabaseTests(unittest.TestCase):
         self.assertIsNone(self.db.get_admin(999))
         self.assertTrue(self.db.set_admin_active(100, False))
         self.assertIsNone(self.db.get_admin(100))
+        with self.assertRaises(PermissionError):
+            self.db.save_order(100, draft("disabled"), allow_duplicate=False)
 
     def test_admin_identifiers_are_unique(self) -> None:
         with self.assertRaises(ValueError):
@@ -72,4 +74,3 @@ class DatabaseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
