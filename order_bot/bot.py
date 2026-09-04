@@ -174,8 +174,7 @@ def render_order_html(order: dict[str, Any], admin: Admin, timezone: str) -> str
         f"محصول: {esc(order['product_raw'])}\n"
         f"تعداد: {esc(order['quantity'])}\n"
         f"مبلغ: {esc(amount)}\n"
-        f"توضیحات: {esc(order.get('notes'))}\n"
-        f"تکراری: {'بله' if order.get('duplicate_of') else 'خیر'}"
+        f"توضیحات: {esc(order.get('notes'))}"
     )
 
 
