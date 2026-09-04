@@ -6,7 +6,18 @@ from unittest.mock import AsyncMock
 
 from aiogram.exceptions import TelegramBadRequest
 
-from order_bot.bot import MAX_CAPTION_LENGTH, authorized_admin, owner_only, publish_order, render_order_html
+from order_bot.bot import (
+    BACK,
+    CANCEL,
+    MAX_CAPTION_LENGTH,
+    RESTART,
+    authorized_admin,
+    navigation_keyboard,
+    owner_only,
+    preview_keyboard,
+    publish_order,
+    render_order_html,
+)
 from order_bot.config import Config
 from order_bot.database import Database
 from tests.test_database import draft
@@ -17,7 +28,7 @@ class BotLogicTests(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.db = Database(str(Path(self.temp.name) / "orders.sqlite3"))
         self.db.initialize()
-        self.admin = self.db.add_admin(100, "<فروشنده>", "ADM&1")
+        self.admin = self.db.add_admin(100, "<فروشنده>", "ADM-1")
         self.config = Config("token", 1, -1001, self.db.path)
 
     def tearDown(self) -> None:
@@ -33,7 +44,19 @@ class BotLogicTests(unittest.IsolatedAsyncioTestCase):
         order["customer_name"] = "<b>bad</b> & text"
         text = render_order_html(order, self.admin, "Asia/Tehran")
         self.assertIn("&lt;b&gt;bad&lt;/b&gt; &amp; text", text)
-        self.assertIn("ADM&amp;1", text)
+        self.assertIn("&lt;فروشنده&gt;", text)
+
+    def test_preview_supports_confirm_edit_and_cancel(self) -> None:
+        callbacks = {
+            button.callback_data
+            for row in preview_keyboard().inline_keyboard
+            for button in row
+        }
+        self.assertEqual(callbacks, {"order:confirm", "order:edit", "order:cancel"})
+
+    def test_navigation_supports_back_restart_and_cancel(self) -> None:
+        labels = {button.text for row in navigation_keyboard().keyboard for button in row}
+        self.assertTrue({BACK, RESTART, CANCEL}.issubset(labels))
 
     async def test_short_text_is_sent_as_caption(self) -> None:
         order = self.make_order()
@@ -60,6 +83,21 @@ class BotLogicTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failed["delivery_status"], "failed")
         bot.send_photo = AsyncMock(return_value=SimpleNamespace(message_id=12))
         self.assertTrue(await publish_order(bot, self.db, self.config, failed, self.admin))
+
+    async def test_long_message_retry_does_not_resend_photo(self) -> None:
+        order = self.make_order("partial", notes="x" * MAX_CAPTION_LENGTH)
+        method = SimpleNamespace(__api_method__="sendMessage")
+        bot = SimpleNamespace(
+            send_photo=AsyncMock(return_value=SimpleNamespace(message_id=20)),
+            send_message=AsyncMock(side_effect=TelegramBadRequest(method, "failed")),
+        )
+        self.assertFalse(await publish_order(bot, self.db, self.config, order, self.admin))
+        failed = self.db.get_order_by_id(order["id"])
+        self.assertEqual(failed["channel_photo_message_id"], 20)
+        bot.send_photo.reset_mock()
+        bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=21))
+        self.assertTrue(await publish_order(bot, self.db, self.config, failed, self.admin))
+        bot.send_photo.assert_not_awaited()
 
     async def test_unknown_user_is_rejected_server_side(self) -> None:
         event = SimpleNamespace(

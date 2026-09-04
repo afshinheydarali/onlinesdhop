@@ -10,7 +10,6 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType, ParseMode
-from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -184,16 +183,21 @@ async def publish_order(bot: Bot, db: Database, config: Config, order: dict[str,
             photo_message = await bot.send_photo(
                 config.orders_channel_id, order["photo_file_id"], caption=text, parse_mode=ParseMode.HTML
             )
+            photo_message_id = photo_message.message_id
             text_message_id = None
         else:
-            photo_message = await bot.send_photo(config.orders_channel_id, order["photo_file_id"])
+            photo_message_id = order.get("channel_photo_message_id")
+            if not photo_message_id:
+                photo_message = await bot.send_photo(config.orders_channel_id, order["photo_file_id"])
+                photo_message_id = photo_message.message_id
+                db.mark_photo_sent(order["id"], photo_message_id)
             text_message = await bot.send_message(
-                config.orders_channel_id, text, parse_mode=ParseMode.HTML, reply_to_message_id=photo_message.message_id
+                config.orders_channel_id, text, parse_mode=ParseMode.HTML, reply_to_message_id=photo_message_id
             )
             text_message_id = text_message.message_id
-        db.mark_delivered(order["id"], photo_message.message_id, text_message_id)
+        db.mark_delivered(order["id"], photo_message_id, text_message_id)
         return True
-    except TelegramAPIError as exc:
+    except Exception as exc:
         LOGGER.error("Order %s delivery failed: %s", order["public_id"], type(exc).__name__)
         db.mark_delivery_failed(order["id"], type(exc).__name__)
         return False
@@ -314,6 +318,9 @@ def create_router() -> Router:
         if not await authorized_admin(message, state, db):
             return
         current = await state.get_state()
+        if not current or not current.startswith(f"{OrderForm.__name__}:"):
+            await message.answer("ابتدا «ثبت سفارش جدید» را انتخاب کنید.", reply_markup=main_keyboard())
+            return
         index = next((i for i, (_, item_state, _, _) in enumerate(STEPS) if item_state.state == current), 0)
         await prompt_step(message, state, max(0, index - 1))
 
@@ -363,7 +370,11 @@ def create_router() -> Router:
                 await message.answer(str(exc))
                 return
         await state.update_data(**parsed)
-        await prompt_step(message, state, index + 1)
+        data = await state.get_data()
+        if index + 1 == len(STEPS) - 1 and data.get("photo_file_id"):
+            await show_preview(message, state)
+        else:
+            await prompt_step(message, state, index + 1)
 
     for _, step_state, _, _ in STEPS[:-1]:
         router.message(step_state)(collect_text)
@@ -372,6 +383,8 @@ def create_router() -> Router:
     async def edit(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
         if not await authorized_admin(callback, state, db) or not callback.message:
             return
+        if "draft_token" not in await state.get_data():
+            await state.update_data(draft_token=uuid.uuid4().hex)
         await callback.answer()
         await prompt_step(callback.message, state, 0)
 
@@ -389,11 +402,16 @@ def create_router() -> Router:
         if not admin or not callback.message:
             return
         data = await state.get_data()
-        required = {key for key, *_ in STEPS}
+        required = {"draft_token", *(key for key, *_ in STEPS)}
         if not required.issubset(data):
             await callback.answer("پیش‌نویس کامل نیست؛ دوباره شروع کنید.", show_alert=True)
             return
-        result = db.save_order(admin.telegram_id, data, allow_duplicate=allow_duplicate)
+        try:
+            result = db.save_order(admin.telegram_id, data, allow_duplicate=allow_duplicate)
+        except PermissionError:
+            await state.clear()
+            await callback.answer("دسترسی شما فعال نیست.", show_alert=True)
+            return
         if result.duplicate_confirmation_required:
             await callback.answer()
             await callback.message.answer(

@@ -47,6 +47,8 @@ class DatabaseTests(unittest.TestCase):
             self.db.add_admin(100, "دیگری", "ADM-002")
         with self.assertRaises(ValueError):
             self.db.add_admin(101, "دیگری", "adm-001")
+        with self.assertRaises(ValueError):
+            self.db.add_admin(102, "دیگری", "کد نامعتبر")
 
     def test_duplicate_requires_second_confirmation_without_disclosure(self) -> None:
         first = self.db.save_order(100, draft("one"), allow_duplicate=False)

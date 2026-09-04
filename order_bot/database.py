@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 import uuid
 from contextlib import closing
@@ -85,8 +86,8 @@ class Database:
     def add_admin(self, telegram_id: int, name: str, admin_code: str) -> Admin:
         if telegram_id <= 0:
             raise ValueError("Telegram User ID باید مثبت باشد.")
-        name, admin_code = name.strip(), admin_code.strip().upper()
-        if not name or not admin_code or len(name) > 120 or len(admin_code) > 32:
+        name, admin_code = " ".join(name.strip().split()), admin_code.strip().upper()
+        if not name or len(name) > 120 or not re.fullmatch(r"[A-Z0-9_-]{2,32}", admin_code):
             raise ValueError("نام یا کد ادمین نامعتبر است.")
         try:
             with closing(self._connect()) as connection:
@@ -202,6 +203,13 @@ class Database:
                 """UPDATE orders SET delivery_status = 'sent', channel_photo_message_id = ?,
                    channel_text_message_id = ?, delivered_at = ?, delivery_error = NULL WHERE id = ?""",
                 (photo_message_id, text_message_id, datetime.now(UTC).isoformat(), order_id),
+            )
+
+    def mark_photo_sent(self, order_id: int, photo_message_id: int) -> None:
+        with closing(self._connect()) as connection:
+            connection.execute(
+                "UPDATE orders SET channel_photo_message_id = ? WHERE id = ? AND delivery_status = 'sending'",
+                (photo_message_id, order_id),
             )
 
     def mark_delivery_failed(self, order_id: int, error: str) -> None:

@@ -1,2 +1,2 @@
 aiogram==3.31.0
-tzdata==2025.3; platform_system == "Windows"
+tzdata==2025.3
