@@ -25,7 +25,7 @@ def make_token(user: User, minutes: int = 60) -> str:
 
 async def current_actor(token: str = Depends(oauth2)) -> Actor:
     try:
-        claims = jwt.decode(token, _secret, algorithms=["HS256"])
+        claims = jwt.decode(token, _secret, algorithms=["HS256"], options={"require": ["exp", "sub", "token_version"]})
         user_id = int(claims["sub"])
     except (jwt.PyJWTError, KeyError, ValueError, TypeError):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid authentication")
