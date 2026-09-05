@@ -166,6 +166,13 @@ def draft_text(data: dict[str, Any]) -> str:
     )
 
 
+def _preview_snapshot(data: dict[str, Any]) -> dict[str, Any]:
+    return {key: data.get(key) for key, *_ in STEPS} | {
+        "phone_normalized": data.get("phone_normalized"),
+        "product_normalized": data.get("product_normalized"),
+    }
+
+
 def render_order_html(order: dict[str, Any], admin: Admin, timezone: str) -> str:
     def esc(value: object | None) -> str:
         return html.escape(str(value)) if value not in (None, "") else "—"
@@ -224,7 +231,7 @@ async def show_preview(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     text = draft_text(data)
     revision = int(data.get("preview_revision", 0)) + 1
-    snapshot = {key: data.get(key) for key, *_ in STEPS}
+    snapshot = _preview_snapshot(data)
     await state.update_data(preview_revision=revision, preview_snapshot=snapshot, duplicate_warning=False)
     await state.set_state(OrderForm.preview)
     keyboard = preview_keyboard(data["draft_token"], revision)
@@ -433,7 +440,7 @@ def create_router() -> Router:
             await callback.answer("این دکمه منقضی شده است.", show_alert=True)
             return None
         data = await state.get_data()
-        snapshot = {key: data.get(key) for key, *_ in STEPS}
+        snapshot = _preview_snapshot(data)
         if data.get("draft_token") != parts[2] or data.get("preview_revision") != revision or data.get("preview_snapshot") != snapshot:
             await callback.answer("این دکمه منقضی شده است.", show_alert=True)
             return None
@@ -481,8 +488,10 @@ def create_router() -> Router:
         if not required.issubset(data):
             await callback.answer("پیش‌نویس کامل نیست؛ دوباره شروع کنید.", show_alert=True)
             return
+        save_data = dict(data)
+        save_data.update(data["preview_snapshot"])
         try:
-            result = db.save_order(admin.telegram_id, data, allow_duplicate=allow_duplicate)
+            result = db.save_order(admin.telegram_id, save_data, allow_duplicate=allow_duplicate)
         except PermissionError:
             await state.clear()
             await callback.answer("دسترسی شما فعال نیست.", show_alert=True)
@@ -580,8 +589,7 @@ async def run() -> None:
     bot = Bot(config.bot_token)
     try:
         await validate_channel(bot, config)
-        dispatcher = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
-        dispatcher.include_router(create_router())
+        dispatcher = create_dispatcher()
         await dispatcher.start_polling(bot, db=db, config=config, allowed_updates=dispatcher.resolve_used_update_types())
     finally:
         await bot.session.close()
@@ -593,3 +601,9 @@ def main() -> None:
     except ChannelAccessError as exc:
         print(exc, file=sys.stderr)
         raise SystemExit(1) from None
+
+
+def create_dispatcher() -> Dispatcher:
+    dispatcher = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
+    dispatcher.include_router(create_router())
+    return dispatcher
