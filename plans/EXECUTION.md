@@ -17,13 +17,14 @@ Updated: 2026-09-05. User authorized all five plans, GPT Luna executors, logical
 | e869436 | Original audit and five implementation plans |
 | 243d768 | Accepted shared-backend, transaction/delivery and role-permission design documents |
 | 9437732 | Clarified that additive backend work may run independently; integrated completion still requires bot correctness prerequisites |
+| 797f5cf, 85a9b45, 7d29078; integrated bd95678 | Plan001 verified: 34 tests, Ruff, mypy, pip check; GitHub CI successful on Python 3.11 and 3.12 |
 
 ## Current execution status
 
 | Plan | Status | Evidence / remaining gate |
 |---|---|---|
-| 001 | IN PROGRESS / revision review | Initial commits 797f5cf and 85a9b45 independently passed 32 tests, Ruff, mypy and pip check. Reviewer requested stronger real-object authorization/cancel/caption tests and consistent locked runtime installation before integration. |
-| 002 | TODO | Starts after approval of 001. |
+| 001 | DONE | Revision addressed authorization/cancel/caption test gaps and locked runtime installation. Supervisor independently passed 34 tests and all tooling. [CI run 33956758383](https://github.com/afshinheydarali/onlinesdhop/actions/runs/33956758383) passed on both supported Python versions. |
+| 002 | IN PROGRESS | Drift reconciled against bd95678; identity-bound previews and deterministic concurrency regressions are next. |
 | 003 | TODO | Starts after 002. |
 | 004 | IN PROGRESS | ADRs accepted; additive PostgreSQL schema/services/API work in isolated lane. Bot integration and all PG migration/auth/concurrency gates remain required. |
 | 005 | TODO | Commerce, worker, sandbox payment, operations and portfolio deliverables depend on verified 004. |

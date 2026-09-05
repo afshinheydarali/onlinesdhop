@@ -104,8 +104,8 @@ Redis فقط هنگام افزودن FSM با TTL یا cache اندازه‌گی
 
 | پلن | وضعیت | وابستگی |
 |---|---|---|
-| [001 — محیط و تست قابل اتکا](001-verification-baseline.md) | IN PROGRESS — بازبینی اصلاحات | ندارد |
-| [002 — صحت پیش‌نمایش و تأیید](002-draft-integrity.md) | TODO | 001 |
+| [001 — محیط و تست قابل اتکا](001-verification-baseline.md) | DONE — ۳۴ تست و CI هر دو نسخه موفق | ندارد |
+| [002 — صحت پیش‌نمایش و تأیید](002-draft-integrity.md) | IN PROGRESS | 001 |
 | [003 — بازیابی delivery](003-delivery-recovery.md) | TODO | 001 و 002 |
 | [004 — بک‌اند API و PostgreSQL](004-backend-foundation.md) | IN PROGRESS — بخش مستقل؛ ادغام وابسته به مراحل قبل | 001، 002، 003 |
 | [005 — تجارت، عملیات و خروجی رزومه](005-commerce-and-portfolio.md) | TODO | 004 |

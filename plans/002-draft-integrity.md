@@ -1,6 +1,8 @@
 # Plan 002: Bind every order action to the preview the user actually saw
 
-Status TODO. Priority P1. Effort M. Risk MED. Category correctness/concurrency. Planned at f8900a8, 2026-09-04. Depends on 001.
+Status IN PROGRESS. Priority P1. Effort M. Risk MED. Category correctness/concurrency. Planned at f8900a8, 2026-09-04. Depends on 001.
+
+Drift reconciled by supervisor against bd95678 on 2026-09-05: Plan001 added typing narrowings, admin-list splitting, Unicode phone normalization and real handler tests. Callback identity/state and unguarded post-publication clear remain unchanged in behavior. The excerpts below describe the original audit; use `git diff bd95678..HEAD -- order_bot/bot.py tests` for execution drift. No unexplained source changes remain.
 
 ## Context and drift check
 

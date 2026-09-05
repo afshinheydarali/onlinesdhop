@@ -1,6 +1,8 @@
 # Plan 001: Establish repeatable verification and fix bounded input defects
 
-Status: TODO. Priority P1. Effort M. Fix risk LOW, except historical phone-data repair MED. Category tests/dx/bugs. Planned at f8900a8, 2026-09-04. Dependencies: none.
+Status: DONE. Priority P1. Effort M. Fix risk LOW, except historical phone-data repair MED. Category tests/dx/bugs. Planned at f8900a8, 2026-09-04. Dependencies: none.
+
+Supervisor approval, 2026-09-05: reviewed commits 797f5cf, 85a9b45, 7d29078; independently verified 34 tests, Ruff, mypy and pip check. Integrated at bd95678. GitHub Actions run 33956758383 passed on Python 3.11 and 3.12. Minimal typing narrowings in existing bot/database code and Docker constrained installation were approved scope adjustments.
 
 ## Context and drift check
 
