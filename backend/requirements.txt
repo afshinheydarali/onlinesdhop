@@ -6,3 +6,4 @@ alembic
 PyJWT
 pwdlib[argon2]
 httpx
+python-multipart

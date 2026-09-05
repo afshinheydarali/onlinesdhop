@@ -12,6 +12,8 @@ from backend.services.orders import Actor
 passwords = PasswordHash.recommended()
 oauth2 = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/token")
 _secret = os.getenv("JWT_SECRET")
+if not _secret and os.getenv("ENVIRONMENT", "local") == "production":
+    raise RuntimeError("JWT_SECRET is required in production")
 if not _secret:
     _secret = "local-development-only-change-me"
 
