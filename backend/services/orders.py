@@ -45,7 +45,7 @@ class CreateOrderCommand:
 
 @dataclass(frozen=True)
 class CreateOrderResult:
-    order: Order
+    order: Order | None
     created: bool
     duplicate_confirmation_required: bool = False
 
@@ -64,7 +64,7 @@ class OrderService:
     async def create_order(self, command: CreateOrderCommand, actor: Actor) -> CreateOrderResult:
         if actor.role not in {"owner", "manager", "seller"}:
             raise PermissionError("order creation is not permitted")
-        if command.quantity <= 0 or command.quantity > 100_000 or command.amount is not None and command.amount < 0:
+        if type(command.quantity) is not int or command.quantity <= 0 or command.quantity > 100_000 or command.amount is not None and (type(command.amount) is not int or command.amount < 0 or command.amount > 10**15):
             raise ValueError("invalid quantity or amount")
         if not command.idempotency_key.strip() or len(command.idempotency_key) > 200:
             raise ValueError("idempotency key is required")
@@ -75,6 +75,9 @@ class OrderService:
             raise PermissionError("actor is not active")
         if active.telegram_id != actor.telegram_id:
             raise PermissionError("actor identity mismatch")
+        if actor.telegram_id is not None:
+            admin = await self.session.scalar(select(Admin).where(Admin.telegram_id == actor.telegram_id, Admin.is_active.is_(True)))
+            if admin is None: raise PermissionError("actor has no active admin identity")
         phone_normalized = normalize_phone(command.phone_raw)
         product_normalized = normalize_product(command.product_raw)
         if phone_normalized != command.phone_normalized or product_normalized != command.product_normalized:
@@ -101,9 +104,6 @@ class OrderService:
             await self.session.commit()
             return CreateOrderResult(None, False, True)
         now = datetime.now(UTC)
-        if actor.telegram_id is not None:
-            admin = await self.session.scalar(select(Admin).where(Admin.telegram_id == actor.telegram_id, Admin.is_active.is_(True)))
-            if admin is None: raise PermissionError("actor has no active admin identity")
         order = Order(public_id=f"ORD-{now:%Y%m%d}-{uuid.uuid4().hex[:8].upper()}", admin_telegram_id=actor.telegram_id, created_by_id=actor.user_id, customer_name=clean_text(command.customer_name, maximum=120, field="customer_name"), phone_raw=command.phone_raw, phone_normalized=phone_normalized, province=clean_text(command.province, maximum=80, field="province"), city=clean_text(command.city, maximum=80, field="city"), address=clean_text(command.address, maximum=600, field="address"), postal_code=command.postal_code, product_raw=clean_text(command.product_raw, maximum=200, field="product"), product_normalized=product_normalized, quantity=command.quantity, amount=command.amount, notes=command.notes, photo_file_id=command.photo_file_id, duplicate_of=duplicate.id if duplicate else None, draft_token=uuid.uuid4().hex, created_at=now, delivery_status="pending", delivery_attempts=0)
         self.session.add(order)
         await self.session.flush()

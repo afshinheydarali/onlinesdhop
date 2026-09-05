@@ -46,7 +46,7 @@ async def token(form: Annotated[OAuth2PasswordRequestForm, Depends()]):
         if not valid or not user.is_active: raise HTTPException(status_code=401, detail="incorrect credentials")
         return Token(access_token=make_token(user), token_type="bearer")
 
-@app.post("/api/v1/orders", response_model=OrderOut)
+@app.post("/api/v1/orders", response_model=OrderOut, response_model_exclude_none=True)
 async def create_order(payload: OrderIn, actor: Actor = Depends(require("owner", "manager", "seller"))):
     from order_bot.validation import normalize_phone, normalize_product
     async with SessionFactory() as s:
@@ -54,14 +54,14 @@ async def create_order(payload: OrderIn, actor: Actor = Depends(require("owner",
         if result.duplicate_confirmation_required: raise HTTPException(409, "duplicate confirmation required")
         return output(result.order, actor)
 
-@app.get("/api/v1/orders/{public_id}", response_model=OrderOut)
+@app.get("/api/v1/orders/{public_id}", response_model=OrderOut, response_model_exclude_none=True)
 async def get_order(public_id: str, actor: Actor = Depends(require("owner", "manager", "seller", "warehouse"))):
     async with SessionFactory() as s:
         order = await OrderService(s).get_order(public_id, actor)
         if order is None: raise HTTPException(404, "order not found")
         return output(order, actor)
 
-@app.get("/api/v1/orders", response_model=list[OrderOut])
+@app.get("/api/v1/orders", response_model=list[OrderOut], response_model_exclude_none=True)
 async def list_orders(limit: int = Query(50, ge=1, le=100), cursor: int | None = Query(None, ge=1), actor: Actor = Depends(require("owner", "manager", "seller", "warehouse"))):
     async with SessionFactory() as s: return [output(o, actor) for o in await OrderService(s).list_orders(actor, limit=limit, cursor=cursor)]
 
