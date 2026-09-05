@@ -4,11 +4,11 @@
 
 ## پیش‌نیازها
 
-- Python 3.10 تا 3.14 (پیشنهاد: 3.12)
+- Python 3.11 یا 3.12 (پیشنهاد: 3.12)
 - یا Docker و Docker Compose
 - یک Bot و یک کانال خصوصی Telegram
 
-نسخه پروژه روی [`aiogram 3.31.0`](https://pypi.org/project/aiogram/) ثابت شده است. این نسخه در زمان ساخت، نسخه پایدار منتشرشده و سازگار با Python 3.10 تا 3.14 است.
+نسخه پروژه روی [`aiogram 3.31.0`](https://pypi.org/project/aiogram/) ثابت شده است. وابستگی‌های کامل و نسخه‌دار در `requirements-lock.txt` ثبت شده‌اند.
 
 ## ساخت Bot و کانال
 
@@ -105,10 +105,14 @@ Telegram User ID و کد ادمین هر دو یکتا هستند. غیرفعا�
 
 ```powershell
 python -m unittest discover -v
-python -m compileall -q order_bot tests
+python -m unittest tests.test_handlers -v
+python -m pip install -r requirements-dev.txt
+ruff check order_bot tests
+mypy order_bot
+python -m pip check
 ```
 
-تست‌ها دسترسی، مدیریت و غیرفعال‌سازی ادمین، اعتبارسنجی تلفن و ارقام فارسی، caption معتبر/نامعتبر، ثبت معمولی و عکس، تکراری و تأیید دوم، عدم افشای سفارش قبلی، idempotency، کنترل‌های پیش‌نمایش، شکست/retry انتشار، تفکیک caption طولانی و HTML escaping را پوشش می‌دهند.
+تست‌ها با unittest اجرا می‌شوند و جریان‌های مسیریابی‌شده فرم، میان‌بر caption عکس، دسترسی خصوصی و مدیر، اعتبارسنجی تلفن، تکراری و تأیید دوم، شکست/retry انتشار و تفکیک caption طولانی را پوشش می‌دهند. همین بررسی‌ها در CI برای Python 3.11 و 3.12 اجرا می‌شوند.
 
 ## اجرای Docker
 
