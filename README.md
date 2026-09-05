@@ -50,7 +50,7 @@ PowerShell:
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+python -m pip install -r requirements.txt -c requirements-lock.txt
 python -m order_bot
 ```
 
@@ -59,7 +59,7 @@ Linux/macOS:
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt -c requirements-lock.txt
 python -m order_bot
 ```
 
@@ -106,11 +106,22 @@ Telegram User ID و کد ادمین هر دو یکتا هستند. غیرفعا�
 ```powershell
 python -m unittest discover -v
 python -m unittest tests.test_handlers -v
-python -m pip install -r requirements-dev.txt
+python -m pip install -r requirements-dev.txt -c requirements-lock.txt
 ruff check order_bot tests
 mypy order_bot
 python -m pip check
 ```
+
+برای بازسازی دقیق lock از یک محیط مجازی تازه، پس از حذف محیط قبلی این دستورات را اجرا کنید:
+
+```powershell
+Remove-Item -Recurse -Force .venv
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m pip freeze | Set-Content requirements-lock.txt
+```
+
+در Linux/macOS معادل آن `rm -rf .venv`، ساخت محیط با `python3 -m venv .venv`، نصب با `./.venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt` و تولید lock با `./.venv/bin/python -m pip freeze > requirements-lock.txt` است. نصب runtime و Docker همیشه با `requirements.txt` و قید نسخه‌های `requirements-lock.txt` انجام می‌شود.
 
 تست‌ها با unittest اجرا می‌شوند و جریان‌های مسیریابی‌شده فرم، میان‌بر caption عکس، دسترسی خصوصی و مدیر، اعتبارسنجی تلفن، تکراری و تأیید دوم، شکست/retry انتشار و تفکیک caption طولانی را پوشش می‌دهند. همین بررسی‌ها در CI برای Python 3.11 و 3.12 اجرا می‌شوند.
 

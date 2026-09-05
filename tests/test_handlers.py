@@ -10,6 +10,7 @@ from aiogram.types import CallbackQuery, Chat, Message, PhotoSize, Update, User
 from order_bot.bot import NEW_ORDER, SKIP, OrderForm, create_router
 from order_bot.config import Config
 from order_bot.database import Database
+from tests.test_database import draft
 
 
 class RecordingSession:
@@ -64,6 +65,24 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         data = await state.get_data()
         self.assertEqual(data["phone_normalized"], "989121234567")
         self.assertEqual(data["quantity"], 2)
+        preview_message = Message(
+            message_id=3, date=0, chat=Chat(id=100, type="private"),
+            from_user=User(id=100, is_bot=False, first_name="Seller"),
+        )
+        callback = CallbackQuery(
+            id="caption-confirm", from_user=preview_message.from_user, chat_instance="x",
+            message=preview_message, data="order:confirm",
+        )
+        await self.dispatcher.feed_update(
+            self.bot, Update(update_id=3, callback_query=callback), db=self.db, config=self.config,
+        )
+        order = self.db.get_order_by_id(1)
+        self.assertIsNotNone(order)
+        self.assertEqual(order["customer_name"], "علی رضایی")
+        self.assertEqual(order["phone_normalized"], "989121234567")
+        self.assertEqual(order["province"], "تهران")
+        self.assertEqual(order["product_raw"], "SKU-1")
+        self.assertEqual(order["quantity"], 2)
 
     async def test_full_form_optional_skips_and_confirmation_persists(self) -> None:
         await self.feed(self.message(10, NEW_ORDER))
@@ -79,6 +98,8 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(order)
         self.assertEqual(order["phone_normalized"], "989121234567")
         self.assertEqual(order["postal_code"], None)
+        self.assertEqual(order["customer_name"], "علی رضایی")
+        self.assertEqual(order["quantity"], 2)
 
     async def test_invalid_caption_falls_back_to_first_step(self) -> None:
         await self.feed(self.message(40, NEW_ORDER))
@@ -92,10 +113,17 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         await self.feed(self.message(52, "بازگشت"))
         state = self.dispatcher.fsm.get_context(bot=self.bot, chat_id=100, user_id=100)
         self.assertEqual(await state.get_state(), OrderForm.customer_name.state)
-        await self.feed(self.message(53, "شروع مجدد"))
-        self.assertEqual(await state.get_state(), OrderForm.customer_name.state)
+        await self.feed(self.message(52, "لغو"))
+        self.assertIsNone(await state.get_state())
+        await self.feed(self.message(53, NEW_ORDER))
+        first_token = (await state.get_data())["draft_token"]
+        await self.feed(self.message(54, "شروع مجدد"))
+        self.assertNotEqual((await state.get_data())["draft_token"], first_token)
+        await self.feed(self.message(55, "لغو"))
+        self.assertIsNone(await state.get_state())
+        await self.feed(self.message(56, NEW_ORDER))
         self.db.set_admin_active(100, False)
-        await self.feed(self.message(54, "لغو"))
+        await self.feed(self.message(57, "علی رضایی"))
         self.assertIsNone(await state.get_state())
 
     async def test_owner_admin_command_is_routed(self) -> None:
@@ -103,17 +131,53 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         message = Message(message_id=3, date=0, chat=Chat(id=999, type="private"), from_user=user, text="/admin_add 101 ADM-2 New Seller")
         await self.dispatcher.feed_update(self.bot, Update(update_id=3, message=message), db=self.db, config=self.config)
         self.assertIsNotNone(self.db.get_admin(101, active_only=False))
-        for update_id, command in ((6, "/admin_disable 101"), (7, "/admin_enable 101")):
-            command_message = message.model_copy(update={"message_id": update_id, "text": command})
-            await self.dispatcher.feed_update(self.bot, Update(update_id=update_id, message=command_message), db=self.db, config=self.config)
+        command_message = message.model_copy(update={"message_id": 6, "text": "/admin_disable 101"})
+        await self.dispatcher.feed_update(self.bot, Update(update_id=6, message=command_message), db=self.db, config=self.config)
+        self.assertFalse(self.db.get_admin(101, active_only=False).is_active)
+        command_message = message.model_copy(update={"message_id": 7, "text": "/admin_enable 101"})
+        await self.dispatcher.feed_update(self.bot, Update(update_id=7, message=command_message), db=self.db, config=self.config)
         self.assertTrue(self.db.get_admin(101).is_active)
 
+    async def test_inactive_text_and_confirm_are_blocked(self) -> None:
+        await self.feed(self.message(60, NEW_ORDER))
+        await self.feed(self.message(61, "علی رضایی"))
+        state = self.dispatcher.fsm.get_context(bot=self.bot, chat_id=100, user_id=100)
+        self.db.set_admin_active(100, False)
+        await self.feed(self.message(62, "09121234567"))
+        self.assertIsNone(await state.get_state())
+        callback_message = Message(
+            message_id=63, date=0, chat=Chat(id=100, type="private"),
+            from_user=User(id=100, is_bot=False, first_name="Seller"),
+        )
+        callback = CallbackQuery(
+            id="inactive-confirm", from_user=callback_message.from_user, chat_instance="x",
+            message=callback_message, data="order:confirm",
+        )
+        await self.dispatcher.feed_update(
+            self.bot, Update(update_id=63, callback_query=callback), db=self.db, config=self.config,
+        )
+        self.assertTrue(any(getattr(method, "text", "") == "دسترسی شما فعال نیست." for method in self.session.methods))
+        self.assertIsNone(self.db.get_order_by_id(1))
+
     async def test_foreign_retry_callback_cannot_access_order(self) -> None:
+        self.db.add_admin(101, "Other", "ADM-2")
+        saved = self.db.save_order(100, draft("ownership"), allow_duplicate=True).order
+        self.assertIsNotNone(saved)
         user = User(id=101, is_bot=False, first_name="Other")
         message = Message(message_id=8, date=0, chat=Chat(id=100, type="private"), from_user=user)
-        callback = CallbackQuery(id="retry", from_user=user, chat_instance="x", message=message, data="retry:ORD-missing")
+        callback = CallbackQuery(id="retry", from_user=user, chat_instance="x", message=message, data=f"retry:{saved['public_id']}")
         await self.dispatcher.feed_update(self.bot, Update(update_id=8, callback_query=callback), db=self.db, config=self.config)
-        self.assertTrue(any(getattr(method, "text", "") == "دسترسی شما فعال نیست." for method in self.session.methods))
+        self.assertTrue(any(getattr(method, "text", "") == "سفارش قابل‌دسترسی نیست." for method in self.session.methods))
+        self.assertFalse(any(method.__class__.__name__ == "SendPhoto" for method in self.session.methods))
+        self.assertEqual(self.db.get_order(saved["public_id"])["delivery_attempts"], 0)
+
+    async def test_empty_admin_list_has_fallback(self) -> None:
+        empty_db = Database(str(Path(self.temp.name) / "empty.sqlite3"))
+        empty_db.initialize()
+        user = User(id=999, is_bot=False, first_name="Owner")
+        message = Message(message_id=9, date=0, chat=Chat(id=999, type="private"), from_user=user, text="/admins")
+        await self.dispatcher.feed_update(self.bot, Update(update_id=9, message=message), db=empty_db, config=self.config)
+        self.assertTrue(any(getattr(method, "text", "") == "هیچ ادمینی ثبت نشده است." for method in self.session.methods))
 
     async def test_nonprivate_callback_is_rejected(self) -> None:
         user = User(id=100, is_bot=False, first_name="Seller")
