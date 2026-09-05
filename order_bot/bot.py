@@ -15,6 +15,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -56,6 +57,7 @@ class OrderForm(StatesGroup):
     notes = State()
     photo = State()
     preview = State()
+    duplicate_warning = State()
 
 
 STEPS: list[tuple[str, State, str, bool]] = [
@@ -84,11 +86,19 @@ def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=NEW_ORDER)]], resize_keyboard=True)
 
 
-def preview_keyboard() -> InlineKeyboardMarkup:
+def _callback(action: str, token: str, revision: int) -> str:
+    return f"o:{action}:{token}:{revision}"
+
+
+def preview_keyboard(token: str, revision: int, *, duplicate: bool = False) -> InlineKeyboardMarkup:
+    confirm = "d" if duplicate else "c"
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="تأیید و ارسال", callback_data="order:confirm")],
-            [InlineKeyboardButton(text="ویرایش", callback_data="order:edit"), InlineKeyboardButton(text="لغو", callback_data="order:cancel")],
+            [InlineKeyboardButton(text="ثبت با وجود تکراری بودن" if duplicate else "تأیید و ارسال", callback_data=_callback(confirm, token, revision))],
+            [
+                InlineKeyboardButton(text="ویرایش", callback_data=_callback("e", token, revision)),
+                InlineKeyboardButton(text="لغو", callback_data=_callback("x", token, revision)),
+            ],
         ]
     )
 
@@ -213,12 +223,16 @@ async def publish_order(bot: Bot, db: Database, config: Config, order: dict[str,
 async def show_preview(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     text = draft_text(data)
+    revision = int(data.get("preview_revision", 0)) + 1
+    snapshot = {key: data.get(key) for key, *_ in STEPS}
+    await state.update_data(preview_revision=revision, preview_snapshot=snapshot, duplicate_warning=False)
     await state.set_state(OrderForm.preview)
+    keyboard = preview_keyboard(data["draft_token"], revision)
     if len(text) <= MAX_CAPTION_LENGTH:
-        await message.answer_photo(data["photo_file_id"], caption=text, reply_markup=preview_keyboard())
+        await message.answer_photo(data["photo_file_id"], caption=text, reply_markup=keyboard)
     else:
         photo = await message.answer_photo(data["photo_file_id"])
-        await message.answer(text, reply_to_message_id=photo.message_id, reply_markup=preview_keyboard())
+        await message.answer(text, reply_to_message_id=photo.message_id, reply_markup=keyboard)
 
 
 async def prompt_step(message: Message, state: FSMContext, index: int) -> None:
@@ -368,7 +382,7 @@ def create_router() -> Router:
                 await show_preview(message, state)
                 return
         data = await state.get_data()
-        if current == OrderForm.photo.state and all(key in data for key, *_ in STEPS[:-1]):
+        if current in (OrderForm.photo.state, OrderForm.preview.state, OrderForm.duplicate_warning.state) and all(key in data for key, *_ in STEPS[:-1]):
             await show_preview(message, state)
         else:
             await message.answer("عکس دریافت شد؛ حالا اطلاعات مرحله جاری را وارد کنید.")
@@ -400,29 +414,69 @@ def create_router() -> Router:
     for _, step_state, _, _ in STEPS[:-1]:
         router.message(step_state)(collect_text)
 
-    @router.callback_query(F.data == "order:edit")
-    async def edit(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
-        if not await authorized_admin(callback, state, db) or not isinstance(callback.message, Message):
-            return
-        if "draft_token" not in await state.get_data():
-            await state.update_data(draft_token=uuid.uuid4().hex)
-        await callback.answer()
-        await prompt_step(callback.message, state, 0)
+    async def validate_preview_action(callback: CallbackQuery, state: FSMContext, db: Database) -> tuple[Admin, dict[str, Any], str] | None:
+        admin = await authorized_admin(callback, state, db)
+        if not admin or not callback.data:
+            return None
+        parts = callback.data.split(":")
+        if len(parts) != 4 or parts[0] != "o" or len(parts[2]) != 32:
+            await callback.answer("این دکمه منقضی شده است.", show_alert=True)
+            return None
+        try:
+            uuid.UUID(parts[2])
+            revision = int(parts[3])
+        except ValueError:
+            await callback.answer("این دکمه منقضی شده است.", show_alert=True)
+            return None
+        current = await state.get_state()
+        if current not in (OrderForm.preview.state, OrderForm.duplicate_warning.state):
+            await callback.answer("این دکمه منقضی شده است.", show_alert=True)
+            return None
+        data = await state.get_data()
+        snapshot = {key: data.get(key) for key, *_ in STEPS}
+        if data.get("draft_token") != parts[2] or data.get("preview_revision") != revision or data.get("preview_snapshot") != snapshot:
+            await callback.answer("این دکمه منقضی شده است.", show_alert=True)
+            return None
+        if parts[1] == "d" and (current != OrderForm.duplicate_warning.state or not data.get("duplicate_warning")):
+            await callback.answer("این تأیید منقضی شده است.", show_alert=True)
+            return None
+        return admin, data, parts[1]
 
-    @router.callback_query(F.data == "order:cancel")
-    async def cancel_callback(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+    async def clear_current_draft(state: FSMContext, token: str, revision: int) -> None:
+        data = await state.get_data()
+        if data.get("draft_token") == token and data.get("preview_revision") == revision:
+            await state.clear()
+
+    @router.callback_query(F.data.in_({"order:confirm", "order:confirm_duplicate", "order:edit", "order:cancel"}))
+    async def expired_legacy_action(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
         if not await authorized_admin(callback, state, db):
             return
-        await state.clear()
-        await callback.answer("لغو شد.")
-        if callback.message:
-            await callback.message.answer("سفارش لغو شد.", reply_markup=main_keyboard())
+        await callback.answer("این دکمه منقضی شده است.", show_alert=True)
 
-    async def confirm(callback: CallbackQuery, state: FSMContext, db: Database, config: Config, allow_duplicate: bool) -> None:
-        admin = await authorized_admin(callback, state, db)
-        if not admin or not isinstance(callback.message, Message):
+    @router.callback_query(F.data.startswith("o:"))
+    async def order_action(callback: CallbackQuery, state: FSMContext, db: Database, config: Config) -> None:
+        if not isinstance(callback.message, Message):
             return
-        data = await state.get_data()
+        validated = await validate_preview_action(callback, state, db)
+        if not validated:
+            return
+        admin, data, action = validated
+        token = data["draft_token"]
+        revision = data["preview_revision"]
+        if action == "e":
+            await state.update_data(preview_revision=revision + 1, preview_snapshot=None, duplicate_warning=False)
+            await callback.answer()
+            await prompt_step(callback.message, state, 0)
+            return
+        if action == "x":
+            await state.clear()
+            await callback.answer("لغو شد.")
+            await callback.message.answer("سفارش لغو شد.", reply_markup=main_keyboard())
+            return
+        allow_duplicate = action == "d"
+        if action not in ("c", "d"):
+            await callback.answer("این دکمه منقضی شده است.", show_alert=True)
+            return
         required = {"draft_token", *(key for key, *_ in STEPS)}
         if not required.issubset(data):
             await callback.answer("پیش‌نویس کامل نیست؛ دوباره شروع کنید.", show_alert=True)
@@ -434,13 +488,12 @@ def create_router() -> Router:
             await callback.answer("دسترسی شما فعال نیست.", show_alert=True)
             return
         if result.duplicate_confirmation_required:
+            await state.update_data(duplicate_warning=True)
+            await state.set_state(OrderForm.duplicate_warning)
             await callback.answer()
             await callback.message.answer(
                 "سفارش مشابهی در بازه اخیر وجود دارد. بدون نمایش اطلاعات آن، آیا ثبت سفارش جدید را تأیید می‌کنید؟",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="ثبت با وجود تکراری بودن", callback_data="order:confirm_duplicate")],
-                    [InlineKeyboardButton(text="لغو", callback_data="order:cancel")],
-                ]),
+                reply_markup=preview_keyboard(token, revision, duplicate=True),
             )
             return
         order = result.order
@@ -448,7 +501,7 @@ def create_router() -> Router:
             return
         if not result.created:
             current = db.get_order_by_id(order["id"])
-            await state.clear()
+            await clear_current_draft(state, token, revision)
             await callback.answer("این سفارش قبلاً پردازش شده است.", show_alert=True)
             if current and current["delivery_status"] == "failed":
                 await callback.message.answer(
@@ -458,7 +511,7 @@ def create_router() -> Router:
             return
         await callback.answer("در حال ارسال…")
         sent = await publish_order(cast(Bot, callback.bot), db, config, order, admin)
-        await state.clear()
+        await clear_current_draft(state, token, revision)
         if sent:
             await callback.message.answer(f"سفارش با شماره {order['public_id']} ثبت و ارسال شد.", reply_markup=main_keyboard())
         else:
@@ -466,14 +519,6 @@ def create_router() -> Router:
                 f"سفارش {order['public_id']} ذخیره شد، اما ارسال ناموفق بود.",
                 reply_markup=retry_keyboard(order["public_id"]),
             )
-
-    @router.callback_query(F.data == "order:confirm")
-    async def confirm_once(callback: CallbackQuery, state: FSMContext, db: Database, config: Config) -> None:
-        await confirm(callback, state, db, config, False)
-
-    @router.callback_query(F.data == "order:confirm_duplicate")
-    async def confirm_duplicate(callback: CallbackQuery, state: FSMContext, db: Database, config: Config) -> None:
-        await confirm(callback, state, db, config, True)
 
     @router.callback_query(F.data.startswith("retry:"))
     async def retry(callback: CallbackQuery, state: FSMContext, db: Database, config: Config) -> None:
@@ -535,7 +580,7 @@ async def run() -> None:
     bot = Bot(config.bot_token)
     try:
         await validate_channel(bot, config)
-        dispatcher = Dispatcher()
+        dispatcher = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
         dispatcher.include_router(create_router())
         await dispatcher.start_polling(bot, db=db, config=config, allowed_updates=dispatcher.resolve_used_update_types())
     finally:

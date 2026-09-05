@@ -7,7 +7,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.methods import TelegramMethod
 from aiogram.types import CallbackQuery, Chat, Message, PhotoSize, Update, User
 
-from order_bot.bot import NEW_ORDER, SKIP, OrderForm, create_router
+from order_bot.bot import NEW_ORDER, SKIP, OrderForm, create_router, preview_keyboard
 from order_bot.config import Config
 from order_bot.database import Database
 from tests.test_database import draft
@@ -71,7 +71,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         )
         callback = CallbackQuery(
             id="caption-confirm", from_user=preview_message.from_user, chat_instance="x",
-            message=preview_message, data="order:confirm",
+            message=preview_message, data=preview_keyboard(data["draft_token"], data["preview_revision"]).inline_keyboard[0][0].callback_data,
         )
         await self.dispatcher.feed_update(
             self.bot, Update(update_id=3, callback_query=callback), db=self.db, config=self.config,
@@ -92,7 +92,11 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         state = self.dispatcher.fsm.get_context(bot=self.bot, chat_id=100, user_id=100)
         self.assertEqual(await state.get_state(), OrderForm.preview.state)
         preview_message = Message(message_id=31, date=0, chat=Chat(id=100, type="private"), from_user=User(id=100, is_bot=False, first_name="Seller"))
-        callback = CallbackQuery(id="confirm", from_user=preview_message.from_user, chat_instance="x", message=preview_message, data="order:confirm")
+        data = await state.get_data()
+        callback_data = preview_keyboard(data["draft_token"], data["preview_revision"]).inline_keyboard[0][0].callback_data
+        callback = CallbackQuery(
+            id="confirm", from_user=preview_message.from_user, chat_instance="x", message=preview_message, data=callback_data,
+        )
         await self.dispatcher.feed_update(self.bot, Update(update_id=31, callback_query=callback), db=self.db, config=self.config)
         order = self.db.get_order_by_id(1)
         self.assertIsNotNone(order)
