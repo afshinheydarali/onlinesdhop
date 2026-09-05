@@ -139,9 +139,19 @@ class OrderService:
         now = datetime.now(UTC)
         claim = uuid.uuid4().hex
         row = await self.session.scalar(select(Outbox).where(Outbox.order_id == order_id).with_for_update(skip_locked=True))
-        if row is None or row.status in {"sent", "ambiguous"} or (row.lease_expires_at and row.lease_expires_at > now):
+        if row is None or row.status in {"sent", "ambiguous", "failed"} or (row.lease_expires_at and row.lease_expires_at > now):
             await self.session.rollback()
             return None
+        if row.status == "sending" and row.lease_expires_at and row.lease_expires_at <= now:
+            row.status = "ambiguous"; row.error_code = "lease_expired_manual_reconciliation"
+            order = await self.session.get(Order, order_id)
+            if order: order.delivery_status, order.delivery_error = "ambiguous", row.error_code
+            await self.session.commit()
+            return None
+        if row.next_attempt_at and row.next_attempt_at > now:
+            await self.session.rollback(); return None
+        if row.attempts >= 5:
+            row.status = "failed"; row.error_code = "attempt_limit"; await self.session.commit(); return None
         row.status, row.worker_id, row.claim_token = "sending", worker_id, claim
         row.lease_expires_at, row.attempts = now + timedelta(seconds=max(1, lease_seconds)), row.attempts + 1
         await self.session.commit()
