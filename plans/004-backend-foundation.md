@@ -2,6 +2,8 @@
 
 Status TODO. Priority P2 after correctness work. Effort L (roughly 3 weeks part-time). Risk HIGH for data migration, MED for additive API. Category direction/architecture. Planned at f8900a8, 2026-09-04. Depends on 001-003. This is a staged design and vertical-slice plan, not permission for a big-bang rewrite.
 
+Execution scheduling clarification (supervisor, 2026-09-04): 001-003 are integration and completion prerequisites. Additive schema, API/authentication and service implementation may proceed in an isolated worktree alongside bot fixes, using the accepted ADRs. That lane must not edit existing bot behavior or assume its tests passed. Bot integration, combined regression verification and DONE status remain gated on 001-003. This separates independent work without weakening the acceptance criteria.
+
 ## Current context and drift
 
 Repo D:/projects/onlineshop is an internal aiogram order-entry bot, not a public shop API. database.py contains admins and a single-product orders table. bot.py combines validation orchestration, workflow, presentation and delivery. Baseline tests use unittest with temporary SQLite and mocked network. The original product deliberately limits sellers' access to historic customer data.
