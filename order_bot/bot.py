@@ -6,7 +6,7 @@ import logging
 import sys
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -29,7 +29,6 @@ from .config import Config
 from .database import Admin, Database
 from .validation import CAPTION_TEMPLATE, clean_text, normalize_phone, normalize_product, parse_caption, parse_optional_amount, parse_positive_int
 
-
 LOGGER = logging.getLogger(__name__)
 NEW_ORDER = "ثبت سفارش جدید"
 CANCEL = "لغو"
@@ -37,6 +36,7 @@ BACK = "بازگشت"
 RESTART = "شروع مجدد"
 SKIP = "رد کردن"
 MAX_CAPTION_LENGTH = 1024
+MAX_MESSAGE_LENGTH = 4096
 
 
 class ChannelAccessError(RuntimeError):
@@ -189,10 +189,10 @@ async def publish_order(bot: Bot, db: Database, config: Config, order: dict[str,
             photo_message = await bot.send_photo(
                 config.orders_channel_id, order["photo_file_id"], caption=text, parse_mode=ParseMode.HTML
             )
-            photo_message_id = photo_message.message_id
+            photo_message_id: int | None = photo_message.message_id
             text_message_id = None
         else:
-            photo_message_id = order.get("channel_photo_message_id")
+            photo_message_id = cast(int | None, order.get("channel_photo_message_id"))
             if not photo_message_id:
                 photo_message = await bot.send_photo(config.orders_channel_id, order["photo_file_id"])
                 photo_message_id = photo_message.message_id
@@ -201,6 +201,7 @@ async def publish_order(bot: Bot, db: Database, config: Config, order: dict[str,
                 config.orders_channel_id, text, parse_mode=ParseMode.HTML, reply_to_message_id=photo_message_id
             )
             text_message_id = text_message.message_id
+        assert photo_message_id is not None
         db.mark_delivered(order["id"], photo_message_id, text_message_id)
         return True
     except Exception as exc:
@@ -293,8 +294,19 @@ def create_router() -> Router:
         if not await owner_only(message, state, config):
             return
         rows = db.list_admins()
-        text = "\n".join(f"{item.admin_code} | {item.name} | {item.telegram_id} | {'فعال' if item.is_active else 'غیرفعال'}" for item in rows)
-        await message.answer(text or "هیچ ادمینی ثبت نشده است.")
+        lines = [f"{item.admin_code} | {item.name} | {item.telegram_id} | {'فعال' if item.is_active else 'غیرفعال'}" for item in rows]
+        if not lines:
+            await message.answer("هیچ ادمینی ثبت نشده است.")
+            return
+        chunk = ""
+        for line in lines:
+            candidate = f"{chunk}\n{line}" if chunk else line
+            if chunk and len(candidate) > MAX_MESSAGE_LENGTH:
+                await message.answer(chunk)
+                chunk = line
+            else:
+                chunk = candidate
+        await message.answer(chunk)
 
     @router.message(F.text == NEW_ORDER)
     async def new_order(message: Message, state: FSMContext, db: Database) -> None:
@@ -338,7 +350,10 @@ def create_router() -> Router:
         if not current or not current.startswith(f"{OrderForm.__name__}:"):
             await message.answer("ابتدا «ثبت سفارش جدید» را انتخاب کنید.")
             return
-        await state.update_data(photo_file_id=message.photo[-1].file_id)
+        photos = message.photo
+        if not photos:
+            return
+        await state.update_data(photo_file_id=photos[-1].file_id)
         if message.caption:
             try:
                 parsed = parse_caption(message.caption)
@@ -349,7 +364,7 @@ def create_router() -> Router:
                     return
                 await message.answer("caption نادیده گرفته شد؛ اطلاعات مرحله‌ای قبلی حفظ شد.")
             else:
-                await state.update_data(**parsed)
+                await state.update_data(cast(dict[str, Any], parsed))
                 await show_preview(message, state)
                 return
         data = await state.get_data()
@@ -387,7 +402,7 @@ def create_router() -> Router:
 
     @router.callback_query(F.data == "order:edit")
     async def edit(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
-        if not await authorized_admin(callback, state, db) or not callback.message:
+        if not await authorized_admin(callback, state, db) or not isinstance(callback.message, Message):
             return
         if "draft_token" not in await state.get_data():
             await state.update_data(draft_token=uuid.uuid4().hex)
@@ -405,7 +420,7 @@ def create_router() -> Router:
 
     async def confirm(callback: CallbackQuery, state: FSMContext, db: Database, config: Config, allow_duplicate: bool) -> None:
         admin = await authorized_admin(callback, state, db)
-        if not admin or not callback.message:
+        if not admin or not isinstance(callback.message, Message):
             return
         data = await state.get_data()
         required = {"draft_token", *(key for key, *_ in STEPS)}
@@ -429,6 +444,8 @@ def create_router() -> Router:
             )
             return
         order = result.order
+        if order is None:
+            return
         if not result.created:
             current = db.get_order_by_id(order["id"])
             await state.clear()
@@ -440,7 +457,7 @@ def create_router() -> Router:
                 )
             return
         await callback.answer("در حال ارسال…")
-        sent = await publish_order(callback.bot, db, config, order, admin)
+        sent = await publish_order(cast(Bot, callback.bot), db, config, order, admin)
         await state.clear()
         if sent:
             await callback.message.answer(f"سفارش با شماره {order['public_id']} ثبت و ارسال شد.", reply_markup=main_keyboard())
@@ -467,7 +484,7 @@ def create_router() -> Router:
         if not order:
             await callback.answer("سفارش قابل‌دسترسی نیست.", show_alert=True)
             return
-        sent = await publish_order(callback.bot, db, config, order, admin)
+        sent = await publish_order(cast(Bot, callback.bot), db, config, order, admin)
         await callback.answer("ارسال شد." if sent else "ارسال دوباره ناموفق بود.", show_alert=True)
         if sent:
             await callback.message.answer(f"سفارش {order['public_id']} ارسال شد.", reply_markup=main_keyboard())
