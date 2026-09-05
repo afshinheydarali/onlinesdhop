@@ -13,6 +13,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.models import Admin, IdempotencyKey, Order, Outbox, User
 from order_bot.validation import clean_text, normalize_phone, normalize_product
 
+class IdempotencyConflict(ValueError):
+    pass
+
 
 @dataclass(frozen=True)
 class Actor:
@@ -63,8 +66,10 @@ class OrderService:
             raise PermissionError("order creation is not permitted")
         if command.quantity <= 0 or command.quantity > 100_000 or command.amount is not None and command.amount < 0:
             raise ValueError("invalid quantity or amount")
-        if not command.idempotency_key.strip():
+        if not command.idempotency_key.strip() or len(command.idempotency_key) > 200:
             raise ValueError("idempotency key is required")
+        if len(command.phone_raw) > 30 or len(command.photo_file_id) > 500:
+            raise ValueError("input field too long")
         active = await self.session.scalar(select(User).where(User.id == actor.user_id, User.is_active.is_(True)))
         if active is None or active.role != actor.role:
             raise PermissionError("actor is not active")
@@ -83,7 +88,7 @@ class OrderService:
         idem = await self.session.scalar(select(IdempotencyKey).where(IdempotencyKey.actor_id == actor.user_id, IdempotencyKey.operation == "create_order", IdempotencyKey.key == command.idempotency_key))
         if idem:
             if idem.payload_hash != payload_hash:
-                raise ValueError("idempotency key payload conflict")
+                raise IdempotencyConflict("idempotency key payload conflict")
             existing = await self.session.get(Order, idem.order_id)
             if existing is None:
                 raise RuntimeError("idempotency record has no order")

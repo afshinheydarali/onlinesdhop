@@ -8,7 +8,7 @@ from sqlalchemy import select
 from backend.auth import current_actor, hash_password, make_token, require, verify_password
 from backend.db import SessionFactory
 from backend.models import Admin, User
-from backend.services.orders import Actor, CreateOrderCommand, OrderService
+from backend.services.orders import Actor, CreateOrderCommand, IdempotencyConflict, OrderService
 
 app = FastAPI(title="OnlineShop API", version="1.0.0")
 ROUTE_PERMISSIONS = {"POST /api/v1/auth/token": "public", "POST /api/v1/orders": "owner|manager|seller", "GET /api/v1/orders/{public_id}": "owner|manager|seller|warehouse", "GET /api/v1/orders": "owner|manager|seller|warehouse", "POST /api/v1/admins": "owner", "PATCH /api/v1/admins/{telegram_id}": "owner", "GET /health/live": "public", "GET /health/ready": "public"}
@@ -19,6 +19,7 @@ class OrderIn(Strict):
     product_raw: str; quantity: int = Field(gt=0, le=100000); amount: int | None = Field(default=None, ge=0); notes: str | None = None; photo_file_id: str = ""; idempotency_key: str = Field(min_length=1, max_length=200); allow_duplicate: bool = False
 class AdminIn(Strict): telegram_id: int = Field(gt=0); name: str; admin_code: str
 class ActiveIn(Strict): active: bool
+class UserIn(Strict): username: str = Field(min_length=1, max_length=120); password: str = Field(min_length=12); role: str; telegram_id: int | None = None
 class OrderOut(Strict): public_id: str; created_at: datetime; delivery_status: str; delivery_attempts: int; delivery_error: str | None = None; customer_name: str | None = None; phone_raw: str | None = None; address: str | None = None; product_raw: str | None = None; quantity: int | None = None; amount: int | None = None
 class Token(Strict): access_token: str; token_type: str
 
@@ -31,6 +32,8 @@ def output(order, actor):
 
 @app.exception_handler(ValueError)
 async def value_error(_, exc): return JSONResponse(status_code=422, content={"detail": str(exc)})
+@app.exception_handler(IdempotencyConflict)
+async def idempotency_conflict(_, exc): return JSONResponse(status_code=409, content={"detail": str(exc)})
 @app.exception_handler(PermissionError)
 async def permission_error(_, exc): return JSONResponse(status_code=403, content={"detail": str(exc)})
 
@@ -70,12 +73,32 @@ async def add_admin(payload: AdminIn, actor: Actor = Depends(require("owner"))):
         except Exception: await s.rollback(); raise HTTPException(409, "admin already exists")
     return {"telegram_id": admin.telegram_id, "name": admin.name, "admin_code": admin.admin_code, "is_active": True}
 
+@app.post("/api/v1/users", status_code=201)
+async def add_user(payload: UserIn, actor: Actor = Depends(require("owner"))):
+    if payload.role not in {"owner", "manager", "seller", "warehouse"}: raise HTTPException(422, "invalid role")
+    async with SessionFactory() as s:
+        user = User(username=payload.username, password_hash=hash_password(payload.password), role=payload.role, telegram_id=payload.telegram_id, is_active=True, token_version=0); s.add(user)
+        try: await s.commit()
+        except Exception: await s.rollback(); raise HTTPException(409, "user already exists")
+    return {"id": user.id, "username": user.username, "role": user.role, "is_active": True}
+
+@app.patch("/api/v1/users/{user_id}/revoke")
+async def revoke_user(user_id: int, actor: Actor = Depends(require("owner"))):
+    async with SessionFactory() as s:
+        user = await s.get(User, user_id)
+        if user is None: raise HTTPException(404, "user not found")
+        user.is_active = False; user.token_version += 1; await s.commit()
+    return {"id": user_id, "is_active": False}
+
 @app.patch("/api/v1/admins/{telegram_id}")
 async def set_admin(telegram_id: int, payload: ActiveIn, actor: Actor = Depends(require("owner"))):
     async with SessionFactory() as s:
         admin = await s.get(Admin, telegram_id)
         if admin is None: raise HTTPException(404, "admin not found")
         admin.is_active = payload.active; await s.commit()
+        user = await s.scalar(select(User).where(User.telegram_id == telegram_id))
+        if user and not payload.active:
+            user.is_active = False; user.token_version += 1; await s.commit()
     return {"telegram_id": telegram_id, "is_active": payload.active}
 
 @app.get("/health/live")
