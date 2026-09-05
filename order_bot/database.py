@@ -175,7 +175,8 @@ class Database:
         return SaveResult(dict(row), created=True)
 
     def get_order(self, public_id: str, *, admin_id: int | None = None) -> dict[str, Any] | None:
-        sql, params = "SELECT * FROM orders WHERE public_id = ?", [public_id]
+        sql: str = "SELECT * FROM orders WHERE public_id = ?"
+        params: list[object] = [public_id]
         if admin_id is not None:
             sql += " AND admin_telegram_id = ?"
             params.append(admin_id)

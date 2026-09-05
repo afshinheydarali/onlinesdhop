@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-
+import unicodedata
 
 _DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
 _CAPTION_KEYS = {
@@ -40,6 +40,7 @@ def clean_text(value: str, *, maximum: int, field: str) -> str:
 
 def normalize_phone(value: str) -> str:
     value = value.translate(_DIGITS)
+    value = "".join(str(unicodedata.digit(char)) if char.isdecimal() else char for char in value)
     value = re.sub(r"[\s\-()]", "", value)
     if value.startswith("+98"):
         value = value[1:]

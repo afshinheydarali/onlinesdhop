@@ -9,6 +9,9 @@ class ValidationTests(unittest.TestCase):
         for raw in ("09121234567", "+989121234567", "989121234567", "۰۹۱۲-۱۲۳-۴۵۶۷"):
             self.assertEqual(normalize_phone(raw), expected)
 
+    def test_phone_decimal_scripts_are_canonical_ascii(self) -> None:
+        self.assertEqual(normalize_phone("०९१२१२३४५६७"), "989121234567")
+
     def test_invalid_phone(self) -> None:
         with self.assertRaises(ValueError):
             normalize_phone("123")
