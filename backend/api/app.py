@@ -24,7 +24,10 @@ class Token(Strict): access_token: str; token_type: str
 
 def output(order, actor):
     seller = actor.role == "seller"
-    return OrderOut(public_id=order.public_id, created_at=order.created_at, delivery_status=order.delivery_status, delivery_attempts=order.delivery_attempts, delivery_error=order.delivery_error, **({} if seller else {"customer_name": order.customer_name, "phone_raw": order.phone_raw, "address": order.address, "product_raw": order.product_raw, "quantity": order.quantity, "amount": order.amount}))
+    warehouse = actor.role == "warehouse"
+    fields = {} if seller else {"customer_name": order.customer_name, "phone_raw": order.phone_raw, "address": order.address, "product_raw": order.product_raw, "quantity": order.quantity, "amount": order.amount}
+    if warehouse: fields = {"address": order.address, "product_raw": order.product_raw, "quantity": order.quantity}
+    return OrderOut(public_id=order.public_id, created_at=order.created_at, delivery_status=order.delivery_status, delivery_attempts=order.delivery_attempts, delivery_error=None if warehouse else order.delivery_error, **fields)
 
 @app.exception_handler(ValueError)
 async def value_error(_, exc): return JSONResponse(status_code=422, content={"detail": str(exc)})
@@ -35,7 +38,9 @@ async def permission_error(_, exc): return JSONResponse(status_code=403, content
 async def token(form: Annotated[OAuth2PasswordRequestForm, Depends()]):
     async with SessionFactory() as s:
         user = await s.scalar(select(User).where(User.username == form.username))
-        if user is None or not verify_password(form.password, user.password_hash): raise HTTPException(status_code=401, detail="incorrect credentials")
+        try: valid = user is not None and verify_password(form.password, user.password_hash)
+        except Exception: valid = False
+        if not valid or not user.is_active: raise HTTPException(status_code=401, detail="incorrect credentials")
         return Token(access_token=make_token(user), token_type="bearer")
 
 @app.post("/api/v1/orders", response_model=OrderOut)

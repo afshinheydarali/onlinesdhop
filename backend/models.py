@@ -35,7 +35,8 @@ class Order(Base):
     __tablename__ = "orders"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     public_id: Mapped[str] = mapped_column(String(40), unique=True)
-    admin_telegram_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("admins.telegram_id"))
+    admin_telegram_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("admins.telegram_id"), nullable=True)
+    created_by_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=True)
     customer_name: Mapped[str] = mapped_column(Text)
     phone_raw: Mapped[str] = mapped_column(Text)
     phone_normalized: Mapped[str] = mapped_column(Text)

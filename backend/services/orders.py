@@ -65,14 +65,18 @@ class OrderService:
             raise ValueError("invalid quantity or amount")
         if not command.idempotency_key.strip():
             raise ValueError("idempotency key is required")
-        active = await self.session.scalar(select(User).where(User.id == actor.user_id, User.is_active.is_(True), User.token_version >= 0))
+        active = await self.session.scalar(select(User).where(User.id == actor.user_id, User.is_active.is_(True)))
         if active is None or active.role != actor.role:
             raise PermissionError("actor is not active")
+        if active.telegram_id != actor.telegram_id:
+            raise PermissionError("actor identity mismatch")
         phone_normalized = normalize_phone(command.phone_raw)
         product_normalized = normalize_product(command.product_raw)
         if phone_normalized != command.phone_normalized or product_normalized != command.product_normalized:
             raise ValueError("normalized fields do not match raw values")
-        # pg_advisory_xact_lock is scoped to this transaction and the canonical pair.
+        # Lock idempotency scope first, then business duplicate scope, avoiding cross-pair races.
+        scope_key = int.from_bytes(hashlib.blake2b(f"idem\0{actor.user_id}\0create_order\0{command.idempotency_key}".encode(), digest_size=8).digest(), "big", signed=True)
+        await self.session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": scope_key})
         lock_key = int.from_bytes(hashlib.blake2b(f"{phone_normalized}\0{product_normalized}".encode(), digest_size=8).digest(), "big", signed=True)
         await self.session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": lock_key})
         payload_hash = _hash(command)
@@ -92,12 +96,10 @@ class OrderService:
             await self.session.commit()
             return CreateOrderResult(None, False, True)
         now = datetime.now(UTC)
-        if actor.telegram_id is None:
-            raise ValueError("actor must have a Telegram identity")
-        admin = await self.session.scalar(select(Admin).where(Admin.telegram_id == actor.telegram_id, Admin.is_active.is_(True)))
-        if admin is None:
-            raise PermissionError("actor has no active admin identity")
-        order = Order(public_id=f"ORD-{now:%Y%m%d}-{uuid.uuid4().hex[:8].upper()}", admin_telegram_id=actor.telegram_id, customer_name=clean_text(command.customer_name, maximum=120, field="customer_name"), phone_raw=command.phone_raw, phone_normalized=phone_normalized, province=clean_text(command.province, maximum=80, field="province"), city=clean_text(command.city, maximum=80, field="city"), address=clean_text(command.address, maximum=600, field="address"), postal_code=command.postal_code, product_raw=clean_text(command.product_raw, maximum=200, field="product"), product_normalized=product_normalized, quantity=command.quantity, amount=command.amount, notes=command.notes, photo_file_id=command.photo_file_id, duplicate_of=duplicate.id if duplicate else None, draft_token=uuid.uuid4().hex, created_at=now, delivery_status="pending", delivery_attempts=0)
+        if actor.telegram_id is not None:
+            admin = await self.session.scalar(select(Admin).where(Admin.telegram_id == actor.telegram_id, Admin.is_active.is_(True)))
+            if admin is None: raise PermissionError("actor has no active admin identity")
+        order = Order(public_id=f"ORD-{now:%Y%m%d}-{uuid.uuid4().hex[:8].upper()}", admin_telegram_id=actor.telegram_id, created_by_id=actor.user_id, customer_name=clean_text(command.customer_name, maximum=120, field="customer_name"), phone_raw=command.phone_raw, phone_normalized=phone_normalized, province=clean_text(command.province, maximum=80, field="province"), city=clean_text(command.city, maximum=80, field="city"), address=clean_text(command.address, maximum=600, field="address"), postal_code=command.postal_code, product_raw=clean_text(command.product_raw, maximum=200, field="product"), product_normalized=product_normalized, quantity=command.quantity, amount=command.amount, notes=command.notes, photo_file_id=command.photo_file_id, duplicate_of=duplicate.id if duplicate else None, draft_token=uuid.uuid4().hex, created_at=now, delivery_status="pending", delivery_attempts=0)
         self.session.add(order)
         await self.session.flush()
         self.session.add(IdempotencyKey(actor_id=actor.user_id, operation="create_order", key=command.idempotency_key, payload_hash=payload_hash, order_id=order.id))
@@ -114,7 +116,7 @@ class OrderService:
             raise PermissionError("unknown role")
         query = select(Order).where(Order.public_id == public_id)
         if actor.role == "seller":
-            query = query.where(Order.admin_telegram_id == actor.telegram_id)
+            query = query.where(Order.created_by_id == actor.user_id)
         return await self.session.scalar(query)
 
     async def list_orders(self, actor: Actor, *, limit: int = 50, cursor: int | None = None) -> list[Order]:
@@ -123,7 +125,7 @@ class OrderService:
         limit = max(1, min(limit, 100))
         query = select(Order).order_by(Order.id.desc()).limit(limit)
         if actor.role == "seller":
-            query = query.where(Order.admin_telegram_id == actor.telegram_id)
+            query = query.where(Order.created_by_id == actor.user_id)
         if cursor is not None:
             query = query.where(Order.id < cursor)
         return list((await self.session.scalars(query)).all())
