@@ -153,6 +153,7 @@ class DeliveryRecoveryRoutedTests(unittest.IsolatedAsyncioTestCase):
         await publish_order(self.bot, self.db, self.config, row, self.db.get_admin(100))
         self.assertEqual(self.session.photos, 0)
 
+
 class R1RecoveryAcceptanceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -217,6 +218,15 @@ class R1RecoveryAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(method.__class__.__name__ == "SendPhoto" and method.chat_id == -1001 for method in self.session.methods), 1)
         state = self.dispatcher.fsm.get_context(bot=self.bot, chat_id=100, user_id=100)
         self.assertIsNone(await state.get_state())
+
+    async def confirm(self, row):
+        await self.feed(Update(update_id=1, message=self.message(100, "ثبت سفارش جدید")))
+        state = self.dispatcher.fsm.get_context(bot=self.bot, chat_id=100, user_id=100)
+        await state.update_data(draft_token=row["draft_token"])
+        await self.feed(Update(update_id=2, message=self.message(100, photo=True, caption=self.caption())))
+        preview = next(method for method in reversed(self.session.methods) if method.__class__.__name__ == "SendPhoto")
+        callback_data = preview.reply_markup.inline_keyboard[0][0].callback_data
+        await self.feed(Update(update_id=3, callback_query=self.callback(callback_data)))
 
     async def test_r1_confirm_ack_bad_request_after_real_preview(self):
         await self.confirm_from_real_preview(TelegramBadRequest(SimpleNamespace(__api_method__="answerCallbackQuery"), "query too old"))
@@ -296,3 +306,42 @@ class DeliveryRecoveryDatabaseRegressions(unittest.TestCase):
         self.assertIn("Ambiguous", recovered["delivery_error"])
         self.assertFalse(self.db.claim_delivery(row["id"]))
         self.assertTrue(self.db.claim_delivery(row["id"], allow_ambiguous=True))
+
+
+class R2ReconciliationTests(R1RecoveryAcceptanceTests):
+    async def test_r2_ambiguous_list_prompt_then_explicit_consent_sends_once(self):
+        row = self.db.save_order(100, draft("r2-ambiguous"), allow_duplicate=True).order
+        self.assertTrue(self.db.claim_delivery(row["id"]))
+        self.db.recover_interrupted_deliveries()
+        await self.feed(Update(update_id=1, message=self.message(100, "/recovery")))
+        listing = [method for method in self.session.methods if getattr(method, "reply_markup", None)][-1]
+        retry_data = listing.reply_markup.inline_keyboard[0][0].callback_data
+        self.assertTrue(retry_data.startswith("retry:"))
+        before = len(self.session.methods)
+        await self.feed(Update(update_id=2, callback_query=self.callback(retry_data)))
+        self.assertEqual(self.session.photos, 0)
+        prompt = [method for method in self.session.methods[before:] if getattr(method, "reply_markup", None)][-1]
+        consent = prompt.reply_markup.inline_keyboard[0][0]
+        self.assertEqual(consent.text, "تأیید بررسی دستی و تلاش مجدد")
+        await self.feed(Update(update_id=3, callback_query=self.callback(consent.callback_data)))
+        saved = self.db.get_order_by_id(row["id"])
+        self.assertEqual(saved["delivery_status"], "sent")
+        self.assertEqual(saved["delivery_attempts"], 2)
+        self.assertEqual(self.session.photos, 1)
+        await self.feed(Update(update_id=4, callback_query=self.callback(consent.callback_data)))
+        self.assertEqual(self.session.photos, 1)
+
+    async def test_r2_pending_reconfirmation_from_real_preview_offers_retry(self):
+        row = self.db.save_order(100, draft("r2-pending-" + "a" * 21), allow_duplicate=True).order
+        before = len(self.session.methods)
+        await self.confirm(row)
+        emitted = self.session.methods[before:]
+        buttons = [
+            button
+            for method in emitted
+            if getattr(method, "reply_markup", None) and hasattr(method.reply_markup, "inline_keyboard")
+            for line in method.reply_markup.inline_keyboard
+            for button in line
+        ]
+        self.assertEqual(sum(button.callback_data.startswith("retry:") for button in buttons), 1)
+        self.assertEqual(self.db.get_order_by_id(row["id"])["delivery_status"], "pending")

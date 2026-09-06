@@ -125,7 +125,7 @@ def recovery_keyboard(rows: list[dict[str, Any]], page: int, has_next: bool) -> 
     buttons = [
         [InlineKeyboardButton(
             text=f"{row['public_id']} — {status_label(row)}",
-            callback_data=f"reconcile:{row['public_id']}" if "Ambiguous" in str(row.get("delivery_error", "")) else f"retry:{row['public_id']}",
+            callback_data=f"retry:{row['public_id']}",
         )]
         for row in rows
     ]
@@ -631,7 +631,7 @@ def create_router() -> Router:
                     reply_markup=reconcile_keyboard(order["public_id"]),
                 )
             return
-        sent = await publish_order(cast(Bot, callback.bot), db, config, order, admin, allow_ambiguous=True)
+        sent = await publish_order(cast(Bot, callback.bot), db, config, order, admin)
         current = db.get_order_by_id(order["id"])
         if sent:
             status_message = "ارسال شد."
@@ -654,7 +654,7 @@ def create_router() -> Router:
             await best_effort_callback_answer(callback, "سفارش برای بررسی دستی قابل‌دسترسی نیست.", show_alert=True)
             return
         await best_effort_callback_answer(callback, "تلاش دستی آغاز شد.", show_alert=True)
-        sent = await publish_order(cast(Bot, callback.bot), db, config, order, admin)
+        sent = await publish_order(cast(Bot, callback.bot), db, config, order, admin, allow_ambiguous=True)
         await callback.message.answer(
             f"سفارش {public_id} {'ارسال شد.' if sent else 'در صف بررسی باقی ماند.'}",
             reply_markup=main_keyboard() if sent else retry_keyboard(public_id),
