@@ -3,15 +3,14 @@
 import sqlalchemy as sa
 from alembic import op
 
-revision = "0003_payment_delivery"
-down_revision = "0002_api_attribution"
+revision = "0006_payment_delivery"
+down_revision = "0005_commerce_cascade_cleanup"
 branch_labels = None
 depends_on = None
 
 
 def upgrade() -> None:
     op.add_column("orders", sa.Column("payment_status", sa.String(24), nullable=False, server_default="pending"))
-    op.add_column("orders", sa.Column("payment_currency", sa.String(3), nullable=False, server_default="IRR"))
     op.add_column("orders", sa.Column("fulfillment_status", sa.String(24), nullable=False, server_default="confirmed"))
     op.add_column("orders", sa.Column("expires_at", sa.DateTime(timezone=True), nullable=True))
     op.create_check_constraint(
@@ -60,5 +59,4 @@ def downgrade() -> None:
     op.drop_constraint("ck_orders_payment_status", "orders", type_="check")
     op.drop_column("orders", "expires_at")
     op.drop_column("orders", "fulfillment_status")
-    op.drop_column("orders", "payment_currency")
     op.drop_column("orders", "payment_status")
