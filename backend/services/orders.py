@@ -10,7 +10,7 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.models import Admin, IdempotencyKey, Order, Outbox, User
+from backend.models import Admin, IdempotencyKey, InventoryBalance, Order, OrderItem, Outbox, Product, Reservation, StockMovement, User
 from order_bot.validation import clean_text, normalize_phone, normalize_product
 
 
@@ -51,12 +51,29 @@ class CreateOrderResult:
     duplicate_confirmation_required: bool = False
 
 
+@dataclass(frozen=True)
+class CartLine:
+    sku: str
+    quantity: int
+
+
+@dataclass(frozen=True)
+class CreateCartOrderCommand:
+    customer_name: str
+    phone_raw: str
+    province: str
+    city: str
+    address: str
+    postal_code: str | None
+    items: tuple[CartLine, ...]
+    idempotency_key: str
+    notes: str | None = None
+
+
 def _hash(command: CreateOrderCommand) -> str:
     value = asdict(command)
     value.pop("idempotency_key")
-    return hashlib.sha256(
-        json.dumps(value, sort_keys=True, ensure_ascii=False).encode()
-    ).hexdigest()
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
 class OrderService:
@@ -65,20 +82,12 @@ class OrderService:
         self.duplicate_window_days = duplicate_window_days
 
     async def _active_actor(self, actor: Actor) -> User:
-        user = await self.session.scalar(
-            select(User).where(User.id == actor.user_id, User.is_active.is_(True))
-        )
-        if (
-            user is None
-            or user.role != actor.role
-            or user.telegram_id != actor.telegram_id
-        ):
+        user = await self.session.scalar(select(User).where(User.id == actor.user_id, User.is_active.is_(True)))
+        if user is None or user.role != actor.role or user.telegram_id != actor.telegram_id:
             raise PermissionError("actor is not active")
         return user
 
-    async def create_order(
-        self, command: CreateOrderCommand, actor: Actor
-    ) -> CreateOrderResult:
+    async def create_order(self, command: CreateOrderCommand, actor: Actor) -> CreateOrderResult:
         if actor.role not in {"owner", "manager", "seller"}:
             raise PermissionError("order creation is not permitted")
         if (
@@ -86,11 +95,7 @@ class OrderService:
             or command.quantity <= 0
             or command.quantity > 100_000
             or command.amount is not None
-            and (
-                type(command.amount) is not int
-                or command.amount < 0
-                or command.amount > 10**15
-            )
+            and (type(command.amount) is not int or command.amount < 0 or command.amount > 10**15)
         ):
             raise ValueError("invalid quantity or amount")
         if not command.idempotency_key.strip() or len(command.idempotency_key) > 200:
@@ -99,11 +104,7 @@ class OrderService:
             raise ValueError("input field too long")
         await self._active_actor(actor)
         if actor.telegram_id is not None:
-            admin = await self.session.scalar(
-                select(Admin).where(
-                    Admin.telegram_id == actor.telegram_id, Admin.is_active.is_(True)
-                )
-            )
+            admin = await self.session.scalar(select(Admin).where(Admin.telegram_id == actor.telegram_id, Admin.is_active.is_(True)))
             if admin is None:
                 raise PermissionError("actor has no active admin identity")
         # Canonicalize exactly the values that will be persisted before taking
@@ -111,24 +112,17 @@ class OrderService:
         # replay instead of conflicting merely because of whitespace.
         canonical = replace(
             command,
-            customer_name=clean_text(
-                command.customer_name, maximum=120, field="customer_name"
-            ),
+            customer_name=clean_text(command.customer_name, maximum=120, field="customer_name"),
             province=clean_text(command.province, maximum=80, field="province"),
             city=clean_text(command.city, maximum=80, field="city"),
             address=clean_text(command.address, maximum=600, field="address"),
             product_raw=clean_text(command.product_raw, maximum=200, field="product"),
             phone_raw=command.phone_raw.strip(),
-            notes=clean_text(command.notes, maximum=1000, field="notes")
-            if command.notes
-            else None,
+            notes=clean_text(command.notes, maximum=1000, field="notes") if command.notes else None,
         )
         phone_normalized = normalize_phone(canonical.phone_raw)
         product_normalized = normalize_product(canonical.product_raw)
-        if (
-            phone_normalized != command.phone_normalized
-            or product_normalized != command.product_normalized
-        ):
+        if phone_normalized != command.phone_normalized or product_normalized != command.product_normalized:
             raise ValueError("normalized fields do not match raw values")
         canonical = replace(
             canonical,
@@ -144,19 +138,13 @@ class OrderService:
             "big",
             signed=True,
         )
-        await self.session.execute(
-            text("SELECT pg_advisory_xact_lock(:key)"), {"key": scope_key}
-        )
+        await self.session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": scope_key})
         lock_key = int.from_bytes(
-            hashlib.blake2b(
-                f"{phone_normalized}\0{product_normalized}".encode(), digest_size=8
-            ).digest(),
+            hashlib.blake2b(f"{phone_normalized}\0{product_normalized}".encode(), digest_size=8).digest(),
             "big",
             signed=True,
         )
-        await self.session.execute(
-            text("SELECT pg_advisory_xact_lock(:key)"), {"key": lock_key}
-        )
+        await self.session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": lock_key})
         payload_hash = _hash(canonical)
         idem = await self.session.scalar(
             select(IdempotencyKey).where(
@@ -223,12 +211,135 @@ class OrderService:
                 order_id=order.id,
             )
         )
-        self.session.add(
-            Outbox(order_id=order.id, status="pending", attempts=0, next_attempt_at=now)
-        )
+        self.session.add(Outbox(order_id=order.id, status="pending", attempts=0, next_attempt_at=now))
         try:
             await self.session.commit()
         except IntegrityError:
+            await self.session.rollback()
+            raise
+        return CreateOrderResult(order, True)
+
+    async def create_cart_order(self, command: CreateCartOrderCommand, actor: Actor) -> CreateOrderResult:
+        if actor.role not in {"owner", "manager", "seller"}:
+            raise PermissionError("order creation is not permitted")
+        await self._active_actor(actor)
+        if not command.items or len(command.items) > 100:
+            raise ValueError("at least one item is required")
+        if any(type(x.quantity) is not int or x.quantity <= 0 for x in command.items):
+            raise ValueError("item quantity must be positive")
+        if len({x.sku for x in command.items}) != len(command.items):
+            raise ValueError("duplicate SKU")
+        if not command.idempotency_key.strip() or len(command.idempotency_key) > 200:
+            raise ValueError("idempotency key is required")
+        canonical = {
+            "customer_name": clean_text(command.customer_name, maximum=120, field="customer_name"),
+            "phone_raw": command.phone_raw.strip(),
+            "province": clean_text(command.province, maximum=80, field="province"),
+            "city": clean_text(command.city, maximum=80, field="city"),
+            "address": clean_text(command.address, maximum=600, field="address"),
+            "postal_code": command.postal_code,
+            "items": sorted((x.sku, x.quantity) for x in command.items),
+            "notes": command.notes,
+        }
+        payload_hash = hashlib.sha256(json.dumps(canonical, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        scope_key = int.from_bytes(
+            hashlib.blake2b(f"idem\0{actor.user_id}\0create_cart_order\0{command.idempotency_key}".encode(), digest_size=8).digest(), "big", signed=True
+        )
+        await self.session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": scope_key})
+        idem = await self.session.scalar(
+            select(IdempotencyKey).where(
+                IdempotencyKey.actor_id == actor.user_id, IdempotencyKey.operation == "create_cart_order", IdempotencyKey.key == command.idempotency_key
+            )
+        )
+        if idem:
+            if idem.payload_hash != payload_hash:
+                raise IdempotencyConflict("idempotency key payload conflict")
+            existing = await self.session.get(Order, idem.order_id)
+            if existing is None:
+                raise RuntimeError("idempotency record has no order")
+            await self.session.commit()
+            return CreateOrderResult(existing, False)
+        skus = sorted(x.sku for x in command.items)
+        products = list(
+            (
+                await self.session.scalars(select(Product).where(Product.sku.in_(skus), Product.is_active.is_(True)).order_by(Product.sku).with_for_update())
+            ).all()
+        )
+        if len(products) != len(skus):
+            raise ValueError("unknown or inactive SKU")
+        by_sku = {p.sku: p for p in products}
+        balances = list(
+            (
+                await self.session.scalars(
+                    select(InventoryBalance)
+                    .where(InventoryBalance.product_id.in_([p.id for p in products]))
+                    .order_by(InventoryBalance.product_id)
+                    .with_for_update()
+                )
+            ).all()
+        )
+        by_product = {b.product_id: b for b in balances}
+        lines = []
+        total = 0
+        for item in command.items:
+            product, balance = by_sku[item.sku], by_product.get(by_sku[item.sku].id)
+            if balance is None or balance.on_hand - balance.reserved < item.quantity:
+                raise ValueError("insufficient stock")
+            line_total = product.unit_price * item.quantity
+            total += line_total
+            lines.append((item, product, balance, line_total))
+        if total > 10**15:
+            raise ValueError("order total is too large")
+        now = datetime.now(UTC)
+        phone = normalize_phone(canonical["phone_raw"])
+        order = Order(
+            public_id=f"ORD-{now:%Y%m%d}-{uuid.uuid4().hex[:8].upper()}",
+            admin_telegram_id=actor.telegram_id,
+            created_by_id=actor.user_id,
+            customer_name=canonical["customer_name"],
+            phone_raw=canonical["phone_raw"],
+            phone_normalized=phone,
+            province=canonical["province"],
+            city=canonical["city"],
+            address=canonical["address"],
+            postal_code=canonical["postal_code"],
+            product_raw="[catalog]",
+            product_normalized="[catalog]",
+            quantity=sum(x.quantity for x in command.items),
+            amount=total,
+            currency="IRR",
+            notes=command.notes,
+            photo_file_id="",
+            draft_token=uuid.uuid4().hex,
+            created_at=now,
+            delivery_status="pending",
+            delivery_attempts=0,
+        )
+        self.session.add(order)
+        await self.session.flush()
+        self.session.add(
+            IdempotencyKey(actor_id=actor.user_id, operation="create_cart_order", key=command.idempotency_key, payload_hash=payload_hash, order_id=order.id)
+        )
+        for item, product, balance, line_total in lines:
+            balance.reserved += item.quantity
+            self.session.add(
+                OrderItem(
+                    order_id=order.id,
+                    product_id=product.id,
+                    sku_snapshot=product.sku,
+                    name_snapshot=product.name,
+                    unit_price_snapshot=product.unit_price,
+                    currency_snapshot=product.currency,
+                    quantity=item.quantity,
+                    line_total=line_total,
+                )
+            )
+            self.session.add(Reservation(order_id=order.id, product_id=product.id, quantity=item.quantity, status="reserved"))
+            self.session.add(StockMovement(product_id=product.id, order_id=order.id, quantity=item.quantity, movement_type="reserve"))
+        self.session.add(Outbox(order_id=order.id, status="pending", attempts=0, next_attempt_at=now))
+        try:
+            await self.session.commit()
+        except Exception:
             await self.session.rollback()
             raise
         return CreateOrderResult(order, True)
@@ -242,9 +353,7 @@ class OrderService:
             query = query.where(Order.created_by_id == actor.user_id)
         return await self.session.scalar(query)
 
-    async def list_orders(
-        self, actor: Actor, *, limit: int = 50, cursor: int | None = None
-    ) -> list[Order]:
+    async def list_orders(self, actor: Actor, *, limit: int = 50, cursor: int | None = None) -> list[Order]:
         if actor.role not in {"owner", "manager", "seller", "warehouse"}:
             raise PermissionError("unknown role")
         await self._active_actor(actor)
@@ -256,28 +365,14 @@ class OrderService:
             query = query.where(Order.id < cursor)
         return list((await self.session.scalars(query)).all())
 
-    async def claim_delivery(
-        self, order_id: int, *, worker_id: str, lease_seconds: int = 300
-    ):
+    async def claim_delivery(self, order_id: int, *, worker_id: str, lease_seconds: int = 300):
         now = datetime.now(UTC)
         claim = uuid.uuid4().hex
-        row = await self.session.scalar(
-            select(Outbox)
-            .where(Outbox.order_id == order_id)
-            .with_for_update(skip_locked=True)
-        )
-        if (
-            row is None
-            or row.status in {"sent", "ambiguous", "failed"}
-            or (row.lease_expires_at and row.lease_expires_at > now)
-        ):
+        row = await self.session.scalar(select(Outbox).where(Outbox.order_id == order_id).with_for_update(skip_locked=True))
+        if row is None or row.status in {"sent", "ambiguous", "failed"} or (row.lease_expires_at and row.lease_expires_at > now):
             await self.session.rollback()
             return None
-        if (
-            row.status == "sending"
-            and row.lease_expires_at
-            and row.lease_expires_at <= now
-        ):
+        if row.status == "sending" and row.lease_expires_at and row.lease_expires_at <= now:
             row.status = "ambiguous"
             row.error_code = "lease_expired_manual_reconciliation"
             order = await self.session.get(Order, order_id)
@@ -311,11 +406,7 @@ class OrderService:
         photo_message_id: int,
         text_message_id: int | None = None,
     ) -> None:
-        row = await self.session.scalar(
-            select(Outbox)
-            .where(Outbox.order_id == order_id, Outbox.claim_token == claim_token)
-            .with_for_update()
-        )
+        row = await self.session.scalar(select(Outbox).where(Outbox.order_id == order_id, Outbox.claim_token == claim_token).with_for_update())
         if row is None or row.status != "sending":
             raise ValueError("invalid delivery claim")
         row.status = "sent"
@@ -338,11 +429,7 @@ class OrderService:
         *,
         retry_at: datetime | None = None,
     ) -> None:
-        row = await self.session.scalar(
-            select(Outbox)
-            .where(Outbox.order_id == order_id, Outbox.claim_token == claim_token)
-            .with_for_update()
-        )
+        row = await self.session.scalar(select(Outbox).where(Outbox.order_id == order_id, Outbox.claim_token == claim_token).with_for_update())
         if row is None or row.status != "sending":
             raise ValueError("invalid delivery claim")
         row.status, row.error_code, row.lease_expires_at, row.next_attempt_at = (

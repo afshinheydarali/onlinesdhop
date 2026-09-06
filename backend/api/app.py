@@ -16,9 +16,11 @@ from backend.auth import (
     verify_password_async,
 )
 from backend.db import SessionFactory
-from backend.models import Admin, User
+from backend.models import Admin, InventoryBalance, Product, User
 from backend.services.orders import (
     Actor,
+    CartLine,
+    CreateCartOrderCommand,
     CreateOrderCommand,
     IdempotencyConflict,
     OrderService,
@@ -28,6 +30,9 @@ app = FastAPI(title="OnlineShop API", version="1.0.0")
 ROUTE_PERMISSIONS = {
     "POST /api/v1/auth/token": "public",
     "POST /api/v1/orders": "owner|manager|seller",
+    "POST /api/v1/commerce/orders": "owner|manager|seller",
+    "POST /api/v1/products": "owner|manager",
+    "GET /api/v1/products": "owner|manager|seller|warehouse",
     "GET /api/v1/orders/{public_id}": "owner|manager|seller|warehouse",
     "GET /api/v1/orders": "owner|manager|seller|warehouse",
     "POST /api/v1/admins": "owner",
@@ -60,6 +65,31 @@ class OrderIn(Strict):
     allow_duplicate: bool = False
 
 
+class CartItemIn(Strict):
+    sku: str = Field(min_length=1, max_length=80)
+    quantity: StrictInt = Field(gt=0, le=100000)
+
+
+class CartOrderIn(Strict):
+    customer_name: str = Field(min_length=1, max_length=120)
+    phone_raw: str = Field(min_length=1, max_length=30)
+    province: str = Field(min_length=1, max_length=80)
+    city: str = Field(min_length=1, max_length=80)
+    address: str = Field(min_length=1, max_length=600)
+    postal_code: str | None = Field(default=None, max_length=30)
+    items: list[CartItemIn] = Field(min_length=1, max_length=100)
+    notes: str | None = Field(default=None, max_length=1000)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
+class ProductIn(Strict):
+    sku: str = Field(min_length=1, max_length=80)
+    name: str = Field(min_length=1, max_length=200)
+    unit_price: StrictInt = Field(ge=0, le=10**15)
+    currency: str = Field(default="IRR", min_length=3, max_length=3)
+    on_hand: StrictInt = Field(default=0, ge=0, le=2**31 - 1)
+
+
 class AdminIn(Strict):
     telegram_id: int = Field(gt=0, le=2**63 - 1)
     name: str = Field(min_length=1, max_length=120)
@@ -89,6 +119,7 @@ class OrderOut(Strict):
     product_raw: str | None = None
     quantity: int | None = None
     amount: int | None = None
+    currency: str | None = None
 
 
 class Token(Strict):
@@ -114,6 +145,7 @@ def output(order, actor):
             "product_raw": order.product_raw,
             "quantity": order.quantity,
             "amount": order.amount,
+            "currency": order.currency,
         }
     )
     if warehouse:
@@ -127,11 +159,7 @@ def output(order, actor):
         created_at=order.created_at,
         delivery_status=order.delivery_status,
         delivery_attempts=order.delivery_attempts,
-        delivery_error=(
-            None
-            if warehouse or not order.delivery_error
-            else ("delivery_failed" if seller else order.delivery_error)
-        ),
+        delivery_error=(None if warehouse or not order.delivery_error else ("delivery_failed" if seller else order.delivery_error)),
         **fields,
     )
 
@@ -156,9 +184,7 @@ async def token(form: Annotated[OAuth2PasswordRequestForm, Depends()]):
     async with SessionFactory() as s:
         user = await s.scalar(select(User).where(User.username == form.username))
         try:
-            valid = user is not None and await verify_password_async(
-                form.password, user.password_hash
-            )
+            valid = user is not None and await verify_password_async(form.password, user.password_hash)
         except (ValueError, TypeError, UnknownHashError):
             valid = False
         if not valid or not user.is_active:
@@ -197,6 +223,70 @@ async def create_order(
         if result.duplicate_confirmation_required:
             raise HTTPException(409, "duplicate confirmation required")
         return output(result.order, actor)
+
+
+@app.post("/api/v1/commerce/orders", response_model=OrderOut, response_model_exclude_none=True)
+async def create_cart_order(
+    payload: CartOrderIn,
+    actor: Actor = Depends(require("owner", "manager", "seller")),  # noqa: B008
+):
+    async with SessionFactory() as s:
+        result = await OrderService(s).create_cart_order(
+            CreateCartOrderCommand(
+                payload.customer_name,
+                payload.phone_raw,
+                payload.province,
+                payload.city,
+                payload.address,
+                payload.postal_code,
+                tuple(CartLine(x.sku, x.quantity) for x in payload.items),
+                payload.idempotency_key,
+                payload.notes,
+            ),
+            actor,
+        )
+        return output(result.order, actor)
+
+
+@app.post("/api/v1/products", status_code=201)
+async def create_product(
+    payload: ProductIn,
+    actor: Actor = Depends(require("owner", "manager")),  # noqa: B008
+):
+    if payload.currency != "IRR":
+        raise HTTPException(422, "only IRR is supported")
+    async with SessionFactory() as s:
+        product = Product(sku=payload.sku.strip(), name=payload.name.strip(), unit_price=payload.unit_price, currency=payload.currency, is_active=True)
+        s.add(product)
+        await s.flush()
+        s.add(InventoryBalance(product_id=product.id, on_hand=payload.on_hand, reserved=0))
+        try:
+            await s.commit()
+        except IntegrityError:
+            await s.rollback()
+            raise HTTPException(409, "SKU already exists")
+        return {
+            "id": product.id,
+            "sku": product.sku,
+            "name": product.name,
+            "unit_price": product.unit_price,
+            "currency": product.currency,
+            "on_hand": payload.on_hand,
+        }
+
+
+@app.get("/api/v1/products")
+async def list_products(actor: Actor = Depends(require("owner", "manager", "seller", "warehouse"))):  # noqa: B008
+    async with SessionFactory() as s:
+        rows = (
+            await s.execute(
+                select(Product, InventoryBalance)
+                .join(InventoryBalance, InventoryBalance.product_id == Product.id)
+                .where(Product.is_active.is_(True))
+                .order_by(Product.sku)
+            )
+        ).all()
+        return [{"sku": p.sku, "name": p.name, "unit_price": p.unit_price, "currency": p.currency, "available": b.on_hand - b.reserved} for p, b in rows]
 
 
 @app.get(
@@ -362,6 +452,4 @@ _actual_route_keys = {
     if method not in {"HEAD", "OPTIONS"}
 }
 if _actual_route_keys != set(ROUTE_PERMISSIONS):
-    raise RuntimeError(
-        f"route permission manifest mismatch: {_actual_route_keys ^ set(ROUTE_PERMISSIONS)}"
-    )
+    raise RuntimeError(f"route permission manifest mismatch: {_actual_route_keys ^ set(ROUTE_PERMISSIONS)}")
