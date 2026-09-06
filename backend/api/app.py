@@ -4,7 +4,8 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordRequestForm
-from pydantic import BaseModel, ConfigDict, Field
+from pwdlib.exceptions import UnknownHashError
+from pydantic import BaseModel, ConfigDict, Field, StrictInt
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
@@ -51,8 +52,8 @@ class OrderIn(Strict):
     address: str = Field(min_length=1, max_length=600)
     postal_code: str | None = Field(default=None, max_length=30)
     product_raw: str = Field(min_length=1, max_length=200)
-    quantity: int = Field(gt=0, le=100000)
-    amount: int | None = Field(default=None, ge=0)
+    quantity: StrictInt = Field(gt=0, le=100000)
+    amount: StrictInt | None = Field(default=None, ge=0)
     notes: str | None = Field(default=None, max_length=1000)
     photo_file_id: str = Field(default="", max_length=500)
     idempotency_key: str = Field(min_length=1, max_length=200)
@@ -126,7 +127,11 @@ def output(order, actor):
         created_at=order.created_at,
         delivery_status=order.delivery_status,
         delivery_attempts=order.delivery_attempts,
-        delivery_error=None if warehouse else order.delivery_error,
+        delivery_error=(
+            None
+            if warehouse or not order.delivery_error
+            else ("delivery_failed" if seller else order.delivery_error)
+        ),
         **fields,
     )
 
@@ -154,7 +159,7 @@ async def token(form: Annotated[OAuth2PasswordRequestForm, Depends()]):
             valid = user is not None and await verify_password_async(
                 form.password, user.password_hash
             )
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, UnknownHashError):
             valid = False
         if not valid or not user.is_active:
             raise HTTPException(status_code=401, detail="incorrect credentials")
