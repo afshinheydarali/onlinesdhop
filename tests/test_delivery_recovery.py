@@ -22,6 +22,8 @@ class RecordingSession:
         self.error = error
         self.photos = 0
         self.barrier = None
+        self.entered = None
+        self.fail_text = False
 
     async def __call__(self, bot, method, timeout=None):
         self.methods.append(method)
@@ -29,8 +31,12 @@ class RecordingSession:
             raise self.error
         if method.__class__.__name__ == "SendPhoto":
             self.photos += 1
+            if self.entered:
+                self.entered.set()
             if self.barrier:
                 await self.barrier.wait()
+        if method.__class__.__name__ == "SendMessage" and self.fail_text:
+            raise TelegramBadRequest(SimpleNamespace(__api_method__="sendMessage"), "text failed")
         return Message(message_id=len(self.methods) + 100, date=0, chat=Chat(id=100, type="private"))
 
     async def close(self):
@@ -185,6 +191,14 @@ class R1RecoveryAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             photo=[PhotoSize(file_id="photo-1", file_unique_id="unique", width=10, height=10)] if photo else None,
         )
 
+    async def retry(self, public, dispatcher=None, db=None):
+        await (dispatcher or self.dispatcher).feed_update(
+            self.bot,
+            Update(update_id=99, callback_query=self.callback(f"retry:{public}")),
+            db=db or self.db,
+            config=self.config,
+        )
+
     def callback(self, data, *, uid=100):
         return CallbackQuery(
             id="callback",
@@ -332,9 +346,16 @@ class R2ReconciliationTests(R1RecoveryAcceptanceTests):
         self.assertEqual(self.session.photos, 1)
 
     async def test_r2_pending_reconfirmation_from_real_preview_offers_retry(self):
-        row = self.db.save_order(100, draft("r2-pending-" + "a" * 21), allow_duplicate=True).order
+        await self.feed(Update(update_id=1, message=self.message(100, "ثبت سفارش جدید")))
+        await self.feed(Update(update_id=2, message=self.message(100, photo=True, caption=self.caption())))
+        state = self.dispatcher.fsm.get_context(bot=self.bot, chat_id=100, user_id=100)
+        data = await state.get_data()
+        row = self.db.save_order(100, data, allow_duplicate=True).order
+        assert row is not None
+        preview = next(method for method in reversed(self.session.methods) if method.__class__.__name__ == "SendPhoto")
+        callback_data = preview.reply_markup.inline_keyboard[0][0].callback_data
         before = len(self.session.methods)
-        await self.confirm(row)
+        await self.feed(Update(update_id=3, callback_query=self.callback(callback_data)))
         emitted = self.session.methods[before:]
         buttons = [
             button
@@ -345,3 +366,35 @@ class R2ReconciliationTests(R1RecoveryAcceptanceTests):
         ]
         self.assertEqual(sum(button.callback_data.startswith("retry:") for button in buttons), 1)
         self.assertEqual(self.db.get_order_by_id(row["id"])["delivery_status"], "pending")
+
+    async def test_r2_concurrent_routed_retry_has_one_claim(self):
+        row = self.db.save_order(100, draft("r2-race"), allow_duplicate=True).order
+        self.db.mark_delivery_failed(row["id"], "failed")
+        self.session.entered = asyncio.Event()
+        self.session.barrier = asyncio.Event()
+        first = asyncio.create_task(self.retry(row["public_id"]))
+        await asyncio.wait_for(self.session.entered.wait(), timeout=2)
+        second_dispatcher = create_dispatcher()
+        second = asyncio.create_task(self.feed(Update(update_id=20, callback_query=self.callback(f"retry:{row['public_id']}")), dispatcher=second_dispatcher))
+        await asyncio.wait_for(second, timeout=2)
+        self.session.barrier.set()
+        await asyncio.wait_for(first, timeout=2)
+        self.assertEqual(self.session.photos, 1)
+        self.assertEqual(self.db.get_order_by_id(row["id"])["delivery_status"], "sent")
+
+    async def test_r2_partial_photo_then_fresh_routed_retry_reuses_photo(self):
+        row = self.db.save_order(100, draft("r2-partial"), allow_duplicate=True).order
+        with closing(self.db._connect()) as connection:
+            connection.execute("UPDATE orders SET notes=? WHERE id=?", ("x" * 4096, row["id"]))
+        row = self.db.get_order(row["public_id"])
+        assert row is not None
+        self.session.fail_text = True
+        self.assertFalse(await publish_order(self.bot, self.db, self.config, row, self.db.get_admin(100)))
+        self.assertEqual(self.db.get_order(row["public_id"])["channel_photo_message_id"], 101)
+        reopened = Database(self.path)
+        fresh = create_dispatcher()
+        self.session.fail_text = False
+        await self.feed(Update(update_id=21, callback_query=self.callback(f"retry:{row['public_id']}")), dispatcher=fresh, db=reopened)
+        saved = reopened.get_order(row["public_id"])
+        self.assertEqual(saved["delivery_status"], "sent")
+        self.assertEqual(self.session.photos, 1)
