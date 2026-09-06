@@ -190,7 +190,7 @@ class ImporterIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 )
             ).all()
             self.assertEqual(
-                rows, [(20, 30, "pending"), (30, None, "sending"), (40, None, "sent")]
+                rows, [(20, 30, "pending"), (30, None, "ambiguous"), (40, None, "sent")]
             )
             self.assertEqual(
                 (
@@ -208,6 +208,17 @@ class ImporterIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 ).one(),
                 ("ambiguous", "legacy_delivery_error"),
             )
+            preserved = (
+                await c.execute(
+                    text(
+                        "SELECT amount, notes, photo_file_id, channel_photo_message_id, "
+                        "channel_text_message_id, delivered_at, created_by_id FROM orders WHERE id=40"
+                    )
+                )
+            ).one()
+            self.assertEqual(preserved[:5], (None, None, "file", 21, 22))
+            self.assertEqual(preserved[5].isoformat(), "2026-01-04T00:00:00+00:00")
+            self.assertEqual(preserved[6], 1)
 
     async def test_dry_run_rolls_back_and_invalid_source_rolls_back(self):
         self.assertEqual(await run(self.source, DB_URL, True), 0)
@@ -235,6 +246,34 @@ class ImporterIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await self.counts(), {"users": 1, "admins": 1, "orders": 3, "outbox": 2}
         )
+
+    async def test_ambiguous_failure_maps_order_and_outbox(self):
+        c = sqlite3.connect(self.source)
+        c.execute(
+            "UPDATE orders SET delivery_status='failed', delivery_error='Ambiguous Telegram timeout' WHERE id=30"
+        )
+        c.commit()
+        c.close()
+        await run(self.source, DB_URL, False)
+        async with self.engine.connect() as connection:
+            self.assertEqual(
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT delivery_status, delivery_error, amount, channel_photo_message_id, channel_text_message_id FROM orders WHERE id=30"
+                        )
+                    )
+                ).one(),
+                ("ambiguous", "Ambiguous Telegram timeout", 5, 11, 12),
+            )
+            self.assertEqual(
+                (
+                    await connection.execute(
+                        text("SELECT status, attempts FROM outbox WHERE order_id=30")
+                    )
+                ).one(),
+                ("ambiguous", 3),
+            )
 
     async def test_dry_run_enforces_unique_public_id(self):
         await run(self.source, DB_URL, False)
