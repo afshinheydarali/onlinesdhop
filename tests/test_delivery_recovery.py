@@ -153,11 +153,6 @@ class DeliveryRecoveryRoutedTests(unittest.IsolatedAsyncioTestCase):
         await publish_order(self.bot, self.db, self.config, row, self.db.get_admin(100))
         self.assertEqual(self.session.photos, 0)
 
-    async def test_invalid_page_is_safe(self):
-        await self.feed("/recovery")
-        self.assertTrue(True)
-
-
 class R1RecoveryAcceptanceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -220,6 +215,8 @@ class R1RecoveryAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(order)
         self.assertEqual(order["delivery_status"], "sent")
         self.assertEqual(sum(method.__class__.__name__ == "SendPhoto" and method.chat_id == -1001 for method in self.session.methods), 1)
+        state = self.dispatcher.fsm.get_context(bot=self.bot, chat_id=100, user_id=100)
+        self.assertIsNone(await state.get_state())
 
     async def test_r1_confirm_ack_bad_request_after_real_preview(self):
         await self.confirm_from_real_preview(TelegramBadRequest(SimpleNamespace(__api_method__="answerCallbackQuery"), "query too old"))
@@ -264,3 +261,38 @@ class R1RecoveryAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         self.session.methods.clear()
         await self.feed(Update(update_id=3, message=self.message(100, "/recovery")), dispatcher=fresh, db=reopened)
         self.assertIn(row["public_id"], " ".join(getattr(m, "text", "") for m in self.session.methods))
+
+
+class DeliveryRecoveryDatabaseRegressions(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.db = Database(str(Path(self.temp.name) / "orders.sqlite3"))
+        self.db.initialize()
+        self.db.add_admin(100, "Seller", "A1")
+        self.db.add_admin(101, "Other", "A2")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_pending_failed_query_persists_and_is_owner_scoped(self):
+        row = self.db.save_order(100, draft("persist"), allow_duplicate=True).order
+        self.assertIsNotNone(row)
+        self.db.mark_delivery_failed(row["id"], "TelegramNetworkError")
+        reopened = Database(self.db.path)
+        self.assertEqual([item["public_id"] for item in reopened.list_recoverable_orders(100)], [row["public_id"]])
+        self.assertEqual(reopened.list_recoverable_orders(101), [])
+
+    def test_recovery_query_is_bounded_ordered_and_paginated(self):
+        for index in range(11):
+            self.db.save_order(100, draft(f"ordered-{index}"), allow_duplicate=True)
+        self.assertEqual(len(self.db.list_recoverable_orders(100, limit=10)), 10)
+        self.assertEqual(self.db.list_recoverable_orders(100, limit=10, offset=10)[0]["draft_token"], "ordered-10")
+
+    def test_interrupted_sending_is_explicit_ambiguous_manual_work(self):
+        row = self.db.save_order(100, draft("ambiguous-db"), allow_duplicate=True).order
+        self.assertTrue(self.db.claim_delivery(row["id"]))
+        self.db.recover_interrupted_deliveries()
+        recovered = self.db.get_order_by_id(row["id"])
+        self.assertIn("Ambiguous", recovered["delivery_error"])
+        self.assertFalse(self.db.claim_delivery(row["id"]))
+        self.assertTrue(self.db.claim_delivery(row["id"], allow_ambiguous=True))
