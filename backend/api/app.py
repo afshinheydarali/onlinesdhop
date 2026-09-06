@@ -1,8 +1,9 @@
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Any, cast
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from fastapi.security import OAuth2PasswordRequestForm
 from pwdlib.exceptions import UnknownHashError
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
@@ -132,7 +133,7 @@ class OrderPage(Strict):
     next_cursor: int | None = None
 
 
-def output(order, actor):
+def output(order: Order, actor: Actor) -> OrderOut:
     seller = actor.role == "seller"
     warehouse = actor.role == "warehouse"
     fields = (
@@ -159,35 +160,39 @@ def output(order, actor):
         created_at=order.created_at,
         delivery_status=order.delivery_status,
         delivery_attempts=order.delivery_attempts,
-        delivery_error=(None if warehouse or not order.delivery_error else ("delivery_failed" if seller else order.delivery_error)),
-        **fields,
+        delivery_error=(
+            None
+            if warehouse or not order.delivery_error
+            else ("delivery_failed" if seller else order.delivery_error)
+        ),
+        **cast(Any, fields),
     )
 
 
 @app.exception_handler(ValueError)
-async def value_error(_, exc):
+async def value_error(_: Request, exc: ValueError) -> JSONResponse:
     return JSONResponse(status_code=422, content={"detail": str(exc)})
 
 
 @app.exception_handler(IdempotencyConflict)
-async def idempotency_conflict(_, exc):
+async def idempotency_conflict(_: Request, exc: IdempotencyConflict) -> JSONResponse:
     return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 
 @app.exception_handler(PermissionError)
-async def permission_error(_, exc):
+async def permission_error(_: Request, exc: PermissionError) -> JSONResponse:
     return JSONResponse(status_code=403, content={"detail": str(exc)})
 
 
 @app.post("/api/v1/auth/token", response_model=Token)
-async def token(form: Annotated[OAuth2PasswordRequestForm, Depends()]):
+async def token(form: Annotated[OAuth2PasswordRequestForm, Depends()]) -> Token:
     async with SessionFactory() as s:
         user = await s.scalar(select(User).where(User.username == form.username))
         try:
             valid = user is not None and await verify_password_async(form.password, user.password_hash)
         except (ValueError, TypeError, UnknownHashError):
             valid = False
-        if not valid or not user.is_active:
+        if user is None or not valid or not user.is_active:
             raise HTTPException(status_code=401, detail="incorrect credentials")
         return Token(access_token=make_token(user), token_type="bearer")
 
@@ -196,7 +201,7 @@ async def token(form: Annotated[OAuth2PasswordRequestForm, Depends()]):
 async def create_order(
     payload: OrderIn,
     actor: Actor = Depends(require("owner", "manager", "seller")),  # noqa: B008
-):
+) -> OrderOut:
     from order_bot.validation import normalize_phone, normalize_product
 
     async with SessionFactory() as s:
@@ -222,6 +227,8 @@ async def create_order(
         )
         if result.duplicate_confirmation_required:
             raise HTTPException(409, "duplicate confirmation required")
+        if result.order is None:
+            raise HTTPException(500, "order creation returned no order")
         return output(result.order, actor)
 
 
@@ -297,7 +304,7 @@ async def list_products(actor: Actor = Depends(require("owner", "manager", "sell
 async def get_order(
     public_id: str,
     actor: Actor = Depends(require("owner", "manager", "seller", "warehouse")),  # noqa: B008
-):
+) -> OrderOut:
     async with SessionFactory() as s:
         order = await OrderService(s).get_order(public_id, actor)
         if order is None:
@@ -310,7 +317,7 @@ async def list_orders(
     limit: int = Query(50, ge=1, le=100),
     cursor: int | None = Query(None, ge=1),
     actor: Actor = Depends(require("owner", "manager", "seller", "warehouse")),  # noqa: B008
-):
+) -> OrderPage:
     async with SessionFactory() as s:
         orders = await OrderService(s).list_orders(actor, limit=limit, cursor=cursor)
         return OrderPage(
@@ -320,7 +327,9 @@ async def list_orders(
 
 
 @app.post("/api/v1/admins", status_code=201)
-async def add_admin(payload: AdminIn, actor: Actor = Depends(require("owner"))):  # noqa: B008
+async def add_admin(
+    payload: AdminIn, actor: Actor = Depends(require("owner"))
+) -> dict[str, Any]:  # noqa: B008
     async with SessionFactory() as s:
         admin = Admin(
             telegram_id=payload.telegram_id,
@@ -344,7 +353,9 @@ async def add_admin(payload: AdminIn, actor: Actor = Depends(require("owner"))):
 
 
 @app.post("/api/v1/users", status_code=201)
-async def add_user(payload: UserIn, actor: Actor = Depends(require("owner"))):  # noqa: B008
+async def add_user(
+    payload: UserIn, actor: Actor = Depends(require("owner"))
+) -> dict[str, Any]:  # noqa: B008
     if payload.role not in {"owner", "manager", "seller", "warehouse"}:
         raise HTTPException(422, "invalid role")
     async with SessionFactory() as s:
@@ -371,7 +382,9 @@ async def add_user(payload: UserIn, actor: Actor = Depends(require("owner"))):  
 
 
 @app.patch("/api/v1/users/{user_id}/revoke")
-async def revoke_user(user_id: int, actor: Actor = Depends(require("owner"))):  # noqa: B008
+async def revoke_user(
+    user_id: int, actor: Actor = Depends(require("owner"))
+) -> dict[str, Any]:  # noqa: B008
     async with SessionFactory() as s:
         user = await s.get(User, user_id)
         if user is None:
@@ -387,7 +400,7 @@ async def set_admin(
     telegram_id: int,
     payload: ActiveIn,
     actor: Actor = Depends(require("owner")),  # noqa: B008
-):
+) -> dict[str, Any]:
     async with SessionFactory() as s:
         admin = await s.get(Admin, telegram_id)
         if admin is None:
@@ -406,7 +419,7 @@ async def list_users(
     limit: int = Query(50, ge=1, le=100),
     cursor: int | None = Query(None, ge=1),
     actor: Actor = Depends(require("owner")),  # noqa: B008
-):
+) -> list[dict[str, Any]]:
     async with SessionFactory() as s:
         query = select(User).order_by(User.id).limit(limit)
         if cursor is not None:
@@ -425,12 +438,12 @@ async def list_users(
 
 
 @app.get("/health/live")
-async def live():
+async def live() -> dict[str, str]:
     return {"status": "ok"}
 
 
 @app.get("/health/ready")
-async def ready():
+async def ready() -> dict[str, str]:
     try:
         async with SessionFactory() as s:
             await s.execute(select(1))
@@ -440,14 +453,15 @@ async def ready():
 
 
 # Keep this manifest synchronized with the actual protected/public HTTP surface.
-def _route_key(route, method: str) -> str:
+def _route_key(route: APIRoute, method: str) -> str:
     return f"{method} {route.path}"
 
 
 _actual_route_keys = {
     _route_key(route, method)
     for route in app.routes
-    if route.path.startswith("/api/v1/") or route.path.startswith("/health/")
+    if isinstance(route, APIRoute)
+    and (route.path.startswith("/api/v1/") or route.path.startswith("/health/"))
     for method in getattr(route, "methods", set())
     if method not in {"HEAD", "OPTIONS"}
 }

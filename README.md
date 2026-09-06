@@ -42,6 +42,8 @@ LOG_LEVEL=INFO
 - `DUPLICATE_WINDOW_DAYS`: بازه مقایسه تلفن normalize‌شده و محصول normalize‌شده.
 - `APP_TIMEZONE`: timezone معتبر IANA برای نمایش زمان؛ زمان ذخیره‌شده همیشه UTC است.
 - فایل `.env` توسط Git و Docker build نادیده گرفته می‌شود.
+- برای API PostgreSQL، `DATABASE_URL` و `JWT_SECRET` را در environment تنظیم کنید؛
+  `JWT_SECRET` باید یک مقدار تصادفی واقعی باشد و در مخزن قرار نگیرد.
 
 ## اجرای محلی
 
@@ -115,6 +117,11 @@ mypy order_bot
 python -m pip check
 ```
 
+برای بررسی کامل backend نیز از `ruff check order_bot backend tests scripts migrations`
+و `mypy order_bot backend` استفاده کنید. تست‌های PostgreSQL فقط با
+`TEST_DATABASE_URL` که به یک پایگاه محلی با نام پایان‌یافته به `_test` اشاره کند
+اجرا می‌شوند.
+
 برای بازسازی دقیق lock از یک محیط مجازی تازه، پس از حذف محیط قبلی این دستورات را اجرا کنید:
 
 ```powershell
@@ -130,11 +137,21 @@ python -m venv .venv
 
 ## اجرای Docker
 
-پس از ساخت `.env`:
+Compose به‌صورت پیش‌فرض PostgreSQL، migration job و API را اجرا می‌کند. پیش از اجرا
+مقادیر `POSTGRES_PASSWORD`، `DATABASE_URL` و `JWT_SECRET` را در environment
+تنظیم کنید؛ API فقط پس از آماده‌شدن PostgreSQL و موفقیت `alembic upgrade head`
+شروع می‌شود:
 
 ```powershell
 docker compose up -d --build
 docker compose logs -f bot
+```
+
+سرویس Telegram اختیاری است و فقط با profile آن فعال می‌شود؛ تنظیمات Bot از فایل
+`.env` خوانده می‌شود و تا تکمیل adapter PostgreSQL از SQLite پایدار استفاده می‌کند:
+
+```powershell
+docker compose --profile bot up -d bot
 ```
 
 داده در volume نام‌گذاری‌شده `orders-data` باقی می‌ماند. توقف امن:

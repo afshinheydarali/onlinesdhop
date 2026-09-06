@@ -1,5 +1,6 @@
 import os
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import anyio
 import jwt
@@ -71,7 +72,7 @@ async def current_actor(token: str = Depends(oauth2)) -> Actor:
         return Actor(user_id=user.id, role=user.role, telegram_id=user.telegram_id)
 
 
-def require(*roles: str):
+def require(*roles: str) -> Any:
     async def dependency(actor: Actor = Depends(current_actor)) -> Actor:  # noqa: B008
         if actor.role not in roles:
             raise HTTPException(status_code=403, detail="forbidden")
