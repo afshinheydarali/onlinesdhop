@@ -99,3 +99,38 @@ class CommerceAPIPGTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await s.scalar(select(func.count()).select_from(StockMovement).where(StockMovement.order_id == order.id)), 1)
             self.assertEqual(await s.scalar(select(func.count()).select_from(IdempotencyKey).where(IdempotencyKey.order_id == order.id)), 1)
             self.assertEqual(await s.scalar(select(func.count()).select_from(Outbox).where(Outbox.order_id == order.id)), 1)
+
+    async def test_exact_role_matrix_and_bounded_product_pagination(self):
+        tokens = {role: await self.auth(role) for role in ("owner", "manager", "seller", "warehouse")}
+        product = {"sku": "MATRIX", "name": "Matrix", "unit_price": 10, "on_hand": 10}
+        for role in ("owner", "manager"):
+            self.assertEqual((await self.client.post("/api/v1/products", json=product | {"sku": f"{role}-sku"}, headers=tokens[role])).status_code, 201)
+        for role in ("seller", "warehouse"):
+            self.assertEqual((await self.client.post("/api/v1/products", json=product | {"sku": f"denied-{role}"}, headers=tokens[role])).status_code, 403)
+        self.assertEqual((await self.client.get("/api/v1/products")).status_code, 401)
+        for role in tokens:
+            response = await self.client.get("/api/v1/products?limit=1", headers=tokens[role])
+            self.assertEqual(response.status_code, 200)
+            self.assertLessEqual(len(response.json()["items"]), 1)
+        self.assertEqual((await self.client.get("/api/v1/products?limit=0", headers=tokens["owner"])).status_code, 422)
+        for role in ("owner", "manager", "seller"):
+            payload = {
+                "customer_name": "C",
+                "phone_raw": f"0912123456{len(role)}",
+                "province": "T",
+                "city": "T",
+                "address": "A",
+                "items": [{"sku": "OWNER-SKU", "quantity": 1}],
+                "idempotency_key": f"matrix-{role}",
+            }
+            self.assertEqual((await self.client.post("/api/v1/commerce/orders", json=payload, headers=tokens[role])).status_code, 200)
+        denied = {
+            "customer_name": "C",
+            "phone_raw": "09121234569",
+            "province": "T",
+            "city": "T",
+            "address": "A",
+            "items": [{"sku": "OWNER-SKU", "quantity": 1}],
+            "idempotency_key": "matrix-warehouse",
+        }
+        self.assertEqual((await self.client.post("/api/v1/commerce/orders", json=denied, headers=tokens["warehouse"])).status_code, 403)

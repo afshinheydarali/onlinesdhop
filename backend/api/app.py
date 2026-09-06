@@ -279,17 +279,20 @@ async def create_product(
 
 
 @app.get("/api/v1/products")
-async def list_products(actor: Actor = Depends(require("owner", "manager", "seller", "warehouse"))):  # noqa: B008
+async def list_products(
+    limit: int = Query(50, ge=1, le=100),
+    cursor: str | None = Query(None, min_length=1, max_length=80),
+    actor: Actor = Depends(require("owner", "manager", "seller", "warehouse")),  # noqa: B008
+):
     async with SessionFactory() as s:
-        rows = (
-            await s.execute(
-                select(Product, InventoryBalance)
-                .join(InventoryBalance, InventoryBalance.product_id == Product.id)
-                .where(Product.is_active.is_(True))
-                .order_by(Product.sku)
-            )
-        ).all()
-        return [{"sku": p.sku, "name": p.name, "unit_price": p.unit_price, "currency": p.currency, "available": b.on_hand - b.reserved} for p, b in rows]
+        query = select(Product, InventoryBalance).join(InventoryBalance, InventoryBalance.product_id == Product.id).where(Product.is_active.is_(True))
+        if cursor:
+            query = query.where(Product.sku > cursor.upper())
+        rows = (await s.execute(query.order_by(Product.sku).limit(limit))).all()
+        return {
+            "items": [{"sku": p.sku, "name": p.name, "unit_price": p.unit_price, "currency": p.currency, "available": b.on_hand - b.reserved} for p, b in rows],
+            "next_cursor": rows[-1][0].sku if len(rows) == limit else None,
+        }
 
 
 @app.get(
