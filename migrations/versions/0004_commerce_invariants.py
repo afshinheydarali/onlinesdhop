@@ -17,11 +17,15 @@ def upgrade() -> None:
         ("stock_movements", "ck_stock_movements_type", "movement_type IN ('reserve','release','consume','adjust')"),
     ]:
         op.execute(f"DO $$ BEGIN ALTER TABLE {table} ADD CONSTRAINT {name} CHECK ({expression}); EXCEPTION WHEN duplicate_object THEN NULL; END $$")
-    op.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_stock_movement_order_product_type ON stock_movements (order_id, product_id, movement_type)")
+    op.execute(
+        "DO $$ BEGIN ALTER TABLE stock_movements ADD CONSTRAINT "
+        "uq_stock_movement_order_product_type UNIQUE (order_id, product_id, movement_type); "
+        "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+    )
 
 
 def downgrade() -> None:
-    op.execute("DROP INDEX IF EXISTS uq_stock_movement_order_product_type")
+    op.execute("ALTER TABLE stock_movements DROP CONSTRAINT IF EXISTS uq_stock_movement_order_product_type")
     op.drop_constraint("ck_stock_movements_type", "stock_movements", type_="check")
     op.drop_constraint("ck_stock_movements_quantity_positive", "stock_movements", type_="check")
     op.drop_constraint("ck_reservations_status", "reservations", type_="check")

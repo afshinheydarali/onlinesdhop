@@ -255,7 +255,7 @@ async def create_order(
 async def create_cart_order(
     payload: CartOrderIn,
     actor: Actor = Depends(require("owner", "manager", "seller")),  # noqa: B008
-):
+) -> OrderOut:
     async with SessionFactory() as s:
         result = await OrderService(s).create_cart_order(
             CreateCartOrderCommand(
@@ -271,6 +271,8 @@ async def create_cart_order(
             ),
             actor,
         )
+        if result.order is None:
+            raise HTTPException(500, "order creation returned no order")
         return output(result.order, actor)
 
 
@@ -278,7 +280,7 @@ async def create_cart_order(
 async def create_product(
     payload: ProductIn,
     actor: Actor = Depends(require("owner", "manager")),  # noqa: B008
-):
+) -> dict[str, int | str]:
     if payload.currency != "IRR":
         raise HTTPException(422, "only IRR is supported")
     async with SessionFactory() as s:
@@ -306,7 +308,7 @@ async def list_products(
     limit: int = Query(50, ge=1, le=100),
     cursor: str | None = Query(None, min_length=1, max_length=80),
     actor: Actor = Depends(require("owner", "manager", "seller", "warehouse")),  # noqa: B008
-):
+) -> dict[str, list[dict[str, int | str]] | str | None]:
     async with SessionFactory() as s:
         query = select(Product, InventoryBalance).join(InventoryBalance, InventoryBalance.product_id == Product.id).where(Product.is_active.is_(True))
         if cursor:
