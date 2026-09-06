@@ -19,8 +19,8 @@ def guarded(value):
     return value
 
 
-class InventoryPGTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
+class InventoryFixture:
+    async def fixture_setup(self):
         self.engine = create_async_engine(guarded(DB), poolclass=NullPool)
         self.sf = async_sessionmaker(self.engine, expire_on_commit=False)
         async with self.engine.begin() as c:
@@ -49,7 +49,7 @@ class InventoryPGTests(unittest.IsolatedAsyncioTestCase):
                 s.add(InventoryBalance(product_id=p.id, on_hand=5, reserved=0))
             await s.commit()
 
-    async def asyncTearDown(self):
+    async def fixture_teardown(self):
         await self.engine.dispose()
 
     def command(self, key, items):
@@ -63,7 +63,7 @@ class InventoryPGTests(unittest.IsolatedAsyncioTestCase):
         async with self.sf() as s:
             return await OrderService(s).create_cart_order(self.command(key, items), Actor(self.uid, "owner"))
 
-    async def test_two_buyers_final_unit_and_full_multiitem_rollback(self):
+    async def _scenario_two_buyers_final_unit_and_full_multiitem_rollback(self):
         from backend.models import InventoryBalance
 
         async with self.sf() as s:
@@ -94,7 +94,7 @@ class InventoryPGTests(unittest.IsolatedAsyncioTestCase):
             a = await s.scalar(select(InventoryBalance).where(InventoryBalance.product_id == 1))
             self.assertEqual(a.reserved, 1)
 
-    async def test_opposite_sku_order_no_deadlock_and_snapshot(self):
+    async def _scenario_opposite_sku_order_no_deadlock_and_snapshot(self):
         await asyncio.wait_for(asyncio.gather(self.create("one", (("A", 1), ("B", 1))), self.create("two", (("B", 1), ("A", 1)))), 10)
         from backend.models import OrderItem, Product
 
@@ -105,3 +105,14 @@ class InventoryPGTests(unittest.IsolatedAsyncioTestCase):
             await s.commit()
             item = await s.scalar(select(OrderItem).where(OrderItem.sku_snapshot == "A"))
             self.assertEqual((item.name_snapshot, item.unit_price_snapshot), ("A", 100))
+
+
+class InventoryPGTests(unittest.IsolatedAsyncioTestCase, InventoryFixture):
+    async def asyncSetUp(self):
+        await self.fixture_setup()
+
+    async def asyncTearDown(self):
+        await self.fixture_teardown()
+
+    test_two_buyers_final_unit_and_full_multiitem_rollback = InventoryFixture._scenario_two_buyers_final_unit_and_full_multiitem_rollback
+    test_opposite_sku_order_no_deadlock_and_snapshot = InventoryFixture._scenario_opposite_sku_order_no_deadlock_and_snapshot

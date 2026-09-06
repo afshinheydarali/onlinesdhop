@@ -17,7 +17,7 @@ from backend.auth import (
     verify_password_async,
 )
 from backend.db import SessionFactory
-from backend.models import Admin, InventoryBalance, Product, User
+from backend.models import Admin, InventoryBalance, Order, Product, User
 from backend.services.orders import (
     Actor,
     CartLine,
@@ -160,11 +160,7 @@ def output(order: Order, actor: Actor) -> OrderOut:
         created_at=order.created_at,
         delivery_status=order.delivery_status,
         delivery_attempts=order.delivery_attempts,
-        delivery_error=(
-            None
-            if warehouse or not order.delivery_error
-            else ("delivery_failed" if seller else order.delivery_error)
-        ),
+        delivery_error=(None if warehouse or not order.delivery_error else ("delivery_failed" if seller else order.delivery_error)),
         **cast(Any, fields),
     )
 
@@ -263,7 +259,7 @@ async def create_product(
     if payload.currency != "IRR":
         raise HTTPException(422, "only IRR is supported")
     async with SessionFactory() as s:
-        product = Product(sku=payload.sku.strip(), name=payload.name.strip(), unit_price=payload.unit_price, currency=payload.currency, is_active=True)
+        product = Product(sku=payload.sku.strip().upper(), name=payload.name.strip(), unit_price=payload.unit_price, currency=payload.currency, is_active=True)
         s.add(product)
         await s.flush()
         s.add(InventoryBalance(product_id=product.id, on_hand=payload.on_hand, reserved=0))
@@ -327,9 +323,7 @@ async def list_orders(
 
 
 @app.post("/api/v1/admins", status_code=201)
-async def add_admin(
-    payload: AdminIn, actor: Actor = Depends(require("owner"))
-) -> dict[str, Any]:  # noqa: B008
+async def add_admin(payload: AdminIn, actor: Actor = Depends(require("owner"))) -> dict[str, Any]:  # noqa: B008
     async with SessionFactory() as s:
         admin = Admin(
             telegram_id=payload.telegram_id,
@@ -353,9 +347,7 @@ async def add_admin(
 
 
 @app.post("/api/v1/users", status_code=201)
-async def add_user(
-    payload: UserIn, actor: Actor = Depends(require("owner"))
-) -> dict[str, Any]:  # noqa: B008
+async def add_user(payload: UserIn, actor: Actor = Depends(require("owner"))) -> dict[str, Any]:  # noqa: B008
     if payload.role not in {"owner", "manager", "seller", "warehouse"}:
         raise HTTPException(422, "invalid role")
     async with SessionFactory() as s:
@@ -382,9 +374,7 @@ async def add_user(
 
 
 @app.patch("/api/v1/users/{user_id}/revoke")
-async def revoke_user(
-    user_id: int, actor: Actor = Depends(require("owner"))
-) -> dict[str, Any]:  # noqa: B008
+async def revoke_user(user_id: int, actor: Actor = Depends(require("owner"))) -> dict[str, Any]:  # noqa: B008
     async with SessionFactory() as s:
         user = await s.get(User, user_id)
         if user is None:
@@ -460,8 +450,7 @@ def _route_key(route: APIRoute, method: str) -> str:
 _actual_route_keys = {
     _route_key(route, method)
     for route in app.routes
-    if isinstance(route, APIRoute)
-    and (route.path.startswith("/api/v1/") or route.path.startswith("/health/"))
+    if isinstance(route, APIRoute) and (route.path.startswith("/api/v1/") or route.path.startswith("/health/"))
     for method in getattr(route, "methods", set())
     if method not in {"HEAD", "OPTIONS"}
 }

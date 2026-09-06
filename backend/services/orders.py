@@ -370,9 +370,7 @@ class OrderService:
             query = query.where(Order.id < cursor)
         return list((await self.session.scalars(query)).all())
 
-    async def claim_delivery(
-        self, order_id: int, *, worker_id: str, lease_seconds: int = 300
-        ) -> Outbox | None:
+    async def claim_delivery(self, order_id: int, *, worker_id: str, lease_seconds: int = 300) -> Outbox | None:
         now = datetime.now(UTC)
         claim = uuid.uuid4().hex
         row = await self.session.scalar(select(Outbox).where(Outbox.order_id == order_id).with_for_update(skip_locked=True))
