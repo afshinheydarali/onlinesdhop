@@ -207,12 +207,13 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def claim_delivery(self, order_id: int) -> bool:
+    def claim_delivery(self, order_id: int, *, allow_ambiguous: bool = False) -> bool:
         with closing(self._connect()) as connection:
             cursor = connection.execute(
                 """UPDATE orders SET delivery_status = 'sending', delivery_attempts = delivery_attempts + 1,
-                   delivery_error = NULL WHERE id = ? AND delivery_status IN ('pending', 'failed')""",
-                (order_id,),
+                   delivery_error = NULL WHERE id = ? AND delivery_status IN ('pending', 'failed')
+                   AND (delivery_error IS NULL OR delivery_error NOT LIKE 'Ambiguous %' OR ?)""",
+                (order_id, allow_ambiguous),
             )
         return cursor.rowcount == 1
 

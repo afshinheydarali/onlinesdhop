@@ -235,8 +235,8 @@ def render_order_html(order: dict[str, Any], admin: Admin, timezone: str) -> str
     )
 
 
-async def publish_order(bot: Bot, db: Database, config: Config, order: dict[str, Any], admin: Admin) -> bool:
-    if not db.claim_delivery(order["id"]):
+async def publish_order(bot: Bot, db: Database, config: Config, order: dict[str, Any], admin: Admin, *, allow_ambiguous: bool = False) -> bool:
+    if not db.claim_delivery(order["id"], allow_ambiguous=allow_ambiguous):
         current = db.get_order_by_id(order["id"])
         return bool(current and current["delivery_status"] == "sent")
     text = render_order_html(order, admin, config.app_timezone)
@@ -628,7 +628,7 @@ def create_router() -> Router:
                     reply_markup=reconcile_keyboard(order["public_id"]),
                 )
             return
-        sent = await publish_order(cast(Bot, callback.bot), db, config, order, admin)
+        sent = await publish_order(cast(Bot, callback.bot), db, config, order, admin, allow_ambiguous=True)
         current = db.get_order_by_id(order["id"])
         if sent:
             status_message = "ارسال شد."
