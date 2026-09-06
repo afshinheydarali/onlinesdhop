@@ -258,7 +258,7 @@ class OrderService:
 
     async def claim_delivery(
         self, order_id: int, *, worker_id: str, lease_seconds: int = 300
-    ):
+    ) -> Outbox | None:
         now = datetime.now(UTC)
         claim = uuid.uuid4().hex
         row = await self.session.scalar(
