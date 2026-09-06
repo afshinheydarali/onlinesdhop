@@ -126,7 +126,7 @@ class Product(Base):
 class OrderItem(Base):
     __tablename__ = "order_items"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    order_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("orders.id"))
+    order_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("orders.id", ondelete="CASCADE"))
     product_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("products.id"))
     sku_snapshot: Mapped[str] = mapped_column(String(80))
     name_snapshot: Mapped[str] = mapped_column(String(200))
@@ -156,7 +156,7 @@ class InventoryBalance(Base):
 class Reservation(Base):
     __tablename__ = "reservations"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    order_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("orders.id"))
+    order_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("orders.id", ondelete="CASCADE"))
     product_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("products.id"))
     quantity: Mapped[int] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(20), default="reserved")
@@ -172,7 +172,7 @@ class StockMovement(Base):
     __tablename__ = "stock_movements"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     product_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("products.id"))
-    order_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("orders.id"))
+    order_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("orders.id", ondelete="CASCADE"))
     quantity: Mapped[int] = mapped_column(Integer)
     movement_type: Mapped[str] = mapped_column(String(30))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
