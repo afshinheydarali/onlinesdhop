@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from backend.models import Admin as PgAdmin
@@ -139,6 +140,8 @@ class PostgresPersistence:
             if telegram_id <= 0 or not name or len(name) > 120 or not re.fullmatch(r"[A-Z0-9_-]{2,32}", code):
                 raise ValueError("نام یا کد ادمین نامعتبر است.")
             existing_user = await session.scalar(select(User).where(User.telegram_id == telegram_id))
+            if existing_user is not None and not existing_user.is_active:
+                raise ValueError("حساب کاربر غیرفعال است و بدون فعال‌سازی صریح دوباره قابل استفاده نیست.")
             if existing_user is None:
                 # Telegram sellers have no password login; the unusable hash
                 # keeps the API credential path closed while preserving one
@@ -151,7 +154,11 @@ class PostgresPersistence:
                 )
             row = PgAdmin(telegram_id=telegram_id, name=name, admin_code=code, created_at=datetime.now(UTC), is_active=True)
             session.add(row)
-            await session.commit()
+            try:
+                await session.commit()
+            except IntegrityError as exc:
+                await session.rollback()
+                raise ValueError("Telegram User ID یا کد ادمین قبلاً ثبت شده است.") from exc
             return Admin(row.telegram_id, row.name, row.admin_code, True)
 
     async def set_admin_active(self, telegram_id: int, active: bool) -> bool:
