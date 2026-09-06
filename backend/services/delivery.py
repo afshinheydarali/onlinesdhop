@@ -87,6 +87,17 @@ class DeliveryService:
     async def load_order(self, order_id: int) -> Order | None:
         return await self.session.get(Order, order_id)
 
+    async def list_reconciliation(self, *, limit: int = 100) -> list[Outbox]:
+        """Return bounded ambiguous jobs for an operator reconciliation view."""
+        bounded = max(1, min(limit, 1000))
+        result = await self.session.scalars(
+            select(Outbox)
+            .where(Outbox.status == "ambiguous")
+            .order_by(Outbox.id)
+            .limit(bounded)
+        )
+        return list(result.all())
+
     async def mark_photo_sent(self, claim: DeliveryClaim, message_id: int) -> None:
         await OrderService(self.session).mark_photo_sent(claim.order_id, claim.claim_token, message_id)
 

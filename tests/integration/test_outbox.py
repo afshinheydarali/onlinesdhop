@@ -117,7 +117,7 @@ class OutboxPostgresTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_timeout_becomes_ambiguous_until_explicit_reconciliation(self) -> None:
         from backend.models import Outbox
-        from backend.services.delivery import DeliveryWorker
+        from backend.services.delivery import DeliveryService, DeliveryWorker
         from backend.services.orders import OrderService
 
         worker = DeliveryWorker(self.sf, FakeTransport(timeout=True), worker_id="worker-timeout")
@@ -125,6 +125,7 @@ class OutboxPostgresTests(unittest.IsolatedAsyncioTestCase):
         async with self.sf() as session:
             outbox = await session.scalar(select(Outbox))
             self.assertEqual(outbox.status, "ambiguous")
+            self.assertEqual(len(await DeliveryService(session).list_reconciliation()), 1)
             await OrderService(session).reconcile_ambiguous_delivery(outbox.order_id)
             outbox = await session.scalar(select(Outbox))
             self.assertEqual(outbox.status, "pending")
