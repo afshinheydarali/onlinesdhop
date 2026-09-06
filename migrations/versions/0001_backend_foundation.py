@@ -1,20 +1,96 @@
 """backend foundation tables"""
-from alembic import op
+
 import sqlalchemy as sa
+from alembic import op
 
 revision = "0001_backend_foundation"
 down_revision = None
 branch_labels = None
 depends_on = None
 
+
 def upgrade() -> None:
-    op.create_table("users", sa.Column("id", sa.BigInteger(), primary_key=True), sa.Column("telegram_id", sa.BigInteger(), unique=True), sa.Column("username", sa.String(120), nullable=False, unique=True), sa.Column("password_hash", sa.Text(), nullable=False), sa.Column("role", sa.String(20), nullable=False), sa.Column("is_active", sa.Boolean(), nullable=False, server_default=sa.true()), sa.Column("token_version", sa.Integer(), nullable=False, server_default="0"), sa.CheckConstraint("role IN ('owner','manager','seller','warehouse')", name="ck_users_role"))
-    op.create_table("admins", sa.Column("telegram_id", sa.BigInteger(), primary_key=True), sa.Column("name", sa.String(120), nullable=False), sa.Column("admin_code", sa.String(32), nullable=False), sa.Column("is_active", sa.Boolean(), nullable=False, server_default=sa.true()), sa.Column("created_at", sa.DateTime(timezone=True), nullable=False))
+    op.create_table(
+        "users",
+        sa.Column("id", sa.BigInteger(), primary_key=True),
+        sa.Column("telegram_id", sa.BigInteger(), unique=True),
+        sa.Column("username", sa.String(120), nullable=False, unique=True),
+        sa.Column("password_hash", sa.Text(), nullable=False),
+        sa.Column("role", sa.String(20), nullable=False),
+        sa.Column("is_active", sa.Boolean(), nullable=False, server_default=sa.true()),
+        sa.Column("token_version", sa.Integer(), nullable=False, server_default="0"),
+        sa.CheckConstraint("role IN ('owner','manager','seller','warehouse')", name="ck_users_role"),
+    )
+    op.create_table(
+        "admins",
+        sa.Column("telegram_id", sa.BigInteger(), primary_key=True),
+        sa.Column("name", sa.String(120), nullable=False),
+        sa.Column("admin_code", sa.String(32), nullable=False),
+        sa.Column("is_active", sa.Boolean(), nullable=False, server_default=sa.true()),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    )
     op.execute("CREATE UNIQUE INDEX uq_admins_code_ci ON admins (lower(admin_code))")
-    op.create_table("orders", sa.Column("id", sa.BigInteger(), primary_key=True), sa.Column("public_id", sa.String(40), nullable=False, unique=True), sa.Column("admin_telegram_id", sa.BigInteger(), sa.ForeignKey("admins.telegram_id"), nullable=False), sa.Column("customer_name", sa.Text(), nullable=False), sa.Column("phone_raw", sa.Text(), nullable=False), sa.Column("phone_normalized", sa.Text(), nullable=False), sa.Column("province", sa.Text(), nullable=False), sa.Column("city", sa.Text(), nullable=False), sa.Column("address", sa.Text(), nullable=False), sa.Column("postal_code", sa.Text()), sa.Column("product_raw", sa.Text(), nullable=False), sa.Column("product_normalized", sa.Text(), nullable=False), sa.Column("quantity", sa.Integer(), nullable=False), sa.Column("amount", sa.BigInteger()), sa.Column("notes", sa.Text()), sa.Column("photo_file_id", sa.Text(), nullable=False), sa.Column("duplicate_of", sa.BigInteger(), sa.ForeignKey("orders.id")), sa.Column("draft_token", sa.String(128), nullable=False, unique=True), sa.Column("created_at", sa.DateTime(timezone=True), nullable=False), sa.Column("delivery_status", sa.String(20), nullable=False, server_default="pending"), sa.Column("delivery_attempts", sa.Integer(), nullable=False, server_default="0"), sa.Column("delivery_error", sa.String(500)), sa.Column("channel_photo_message_id", sa.BigInteger()), sa.Column("channel_text_message_id", sa.BigInteger()), sa.Column("delivered_at", sa.DateTime(timezone=True)), sa.CheckConstraint("quantity > 0", name="ck_orders_quantity_positive"), sa.CheckConstraint("amount IS NULL OR amount >= 0", name="ck_orders_amount_nonnegative"), sa.CheckConstraint("delivery_status IN ('pending','sending','sent','failed','ambiguous')", name="ck_orders_delivery_status"))
+    op.create_table(
+        "orders",
+        sa.Column("id", sa.BigInteger(), primary_key=True),
+        sa.Column("public_id", sa.String(40), nullable=False, unique=True),
+        sa.Column("admin_telegram_id", sa.BigInteger(), sa.ForeignKey("admins.telegram_id"), nullable=False),
+        sa.Column("customer_name", sa.Text(), nullable=False),
+        sa.Column("phone_raw", sa.Text(), nullable=False),
+        sa.Column("phone_normalized", sa.Text(), nullable=False),
+        sa.Column("province", sa.Text(), nullable=False),
+        sa.Column("city", sa.Text(), nullable=False),
+        sa.Column("address", sa.Text(), nullable=False),
+        sa.Column("postal_code", sa.Text()),
+        sa.Column("product_raw", sa.Text(), nullable=False),
+        sa.Column("product_normalized", sa.Text(), nullable=False),
+        sa.Column("quantity", sa.Integer(), nullable=False),
+        sa.Column("amount", sa.BigInteger()),
+        sa.Column("notes", sa.Text()),
+        sa.Column("photo_file_id", sa.Text(), nullable=False),
+        sa.Column("duplicate_of", sa.BigInteger(), sa.ForeignKey("orders.id")),
+        sa.Column("draft_token", sa.String(128), nullable=False, unique=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("delivery_status", sa.String(20), nullable=False, server_default="pending"),
+        sa.Column("delivery_attempts", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("delivery_error", sa.String(500)),
+        sa.Column("channel_photo_message_id", sa.BigInteger()),
+        sa.Column("channel_text_message_id", sa.BigInteger()),
+        sa.Column("delivered_at", sa.DateTime(timezone=True)),
+        sa.CheckConstraint("quantity > 0", name="ck_orders_quantity_positive"),
+        sa.CheckConstraint("amount IS NULL OR amount >= 0", name="ck_orders_amount_nonnegative"),
+        sa.CheckConstraint("delivery_status IN ('pending','sending','sent','failed','ambiguous')", name="ck_orders_delivery_status"),
+    )
     op.create_index("ix_orders_duplicate", "orders", ["phone_normalized", "product_normalized", "created_at"])
-    op.create_table("idempotency_keys", sa.Column("id", sa.BigInteger(), primary_key=True), sa.Column("actor_id", sa.BigInteger(), sa.ForeignKey("users.id"), nullable=False), sa.Column("operation", sa.String(80), nullable=False), sa.Column("key", sa.String(200), nullable=False), sa.Column("payload_hash", sa.String(64), nullable=False), sa.Column("order_id", sa.BigInteger(), sa.ForeignKey("orders.id")), sa.UniqueConstraint("actor_id", "operation", "key", name="uq_idempotency_scope"))
-    op.create_table("outbox", sa.Column("id", sa.BigInteger(), primary_key=True), sa.Column("order_id", sa.BigInteger(), sa.ForeignKey("orders.id"), nullable=False, unique=True), sa.Column("status", sa.String(20), nullable=False, server_default="pending"), sa.Column("worker_id", sa.String(120)), sa.Column("claim_token", sa.String(64), unique=True), sa.Column("lease_expires_at", sa.DateTime(timezone=True)), sa.Column("attempts", sa.Integer(), nullable=False, server_default="0"), sa.Column("next_attempt_at", sa.DateTime(timezone=True)), sa.Column("error_code", sa.String(120)))
+    op.create_table(
+        "idempotency_keys",
+        sa.Column("id", sa.BigInteger(), primary_key=True),
+        sa.Column("actor_id", sa.BigInteger(), sa.ForeignKey("users.id"), nullable=False),
+        sa.Column("operation", sa.String(80), nullable=False),
+        sa.Column("key", sa.String(200), nullable=False),
+        sa.Column("payload_hash", sa.String(64), nullable=False),
+        sa.Column("order_id", sa.BigInteger(), sa.ForeignKey("orders.id")),
+        sa.UniqueConstraint("actor_id", "operation", "key", name="uq_idempotency_scope"),
+    )
+    op.create_table(
+        "outbox",
+        sa.Column("id", sa.BigInteger(), primary_key=True),
+        sa.Column("order_id", sa.BigInteger(), sa.ForeignKey("orders.id"), nullable=False, unique=True),
+        sa.Column("status", sa.String(20), nullable=False, server_default="pending"),
+        sa.Column("worker_id", sa.String(120)),
+        sa.Column("claim_token", sa.String(64), unique=True),
+        sa.Column("lease_expires_at", sa.DateTime(timezone=True)),
+        sa.Column("attempts", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("next_attempt_at", sa.DateTime(timezone=True)),
+        sa.Column("error_code", sa.String(120)),
+    )
+
 
 def downgrade() -> None:
-    op.drop_table("outbox"); op.drop_table("idempotency_keys"); op.drop_index("ix_orders_duplicate", table_name="orders"); op.drop_table("orders"); op.execute("DROP INDEX uq_admins_code_ci"); op.drop_table("admins"); op.drop_table("users")
+    op.drop_table("outbox")
+    op.drop_table("idempotency_keys")
+    op.drop_index("ix_orders_duplicate", table_name="orders")
+    op.drop_table("orders")
+    op.execute("DROP INDEX uq_admins_code_ci")
+    op.drop_table("admins")
+    op.drop_table("users")

@@ -10,6 +10,9 @@ RUN pip install --no-cache-dir -r requirements.txt -c requirements-lock.txt \
     && chown bot:bot /data
 
 COPY --chown=bot:bot order_bot ./order_bot
+COPY --chown=bot:bot backend ./backend
+COPY --chown=bot:bot migrations ./migrations
+COPY --chown=bot:bot alembic.ini ./alembic.ini
 USER bot
 CMD ["python", "-m", "order_bot"]
 
