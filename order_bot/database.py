@@ -207,16 +207,6 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def has_recoverable_orders(self, admin_id: int, *, offset: int = 0) -> bool:
-        with closing(self._connect()) as connection:
-            row = connection.execute(
-                """SELECT 1 FROM orders
-                   WHERE admin_telegram_id = ? AND delivery_status IN ('pending', 'failed')
-                   ORDER BY created_at ASC, id ASC LIMIT 1 OFFSET ?""",
-                (admin_id, max(0, offset)),
-            ).fetchone()
-        return row is not None
-
     def claim_delivery(self, order_id: int) -> bool:
         with closing(self._connect()) as connection:
             cursor = connection.execute(
