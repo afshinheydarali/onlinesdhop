@@ -25,8 +25,8 @@ Updated: 2026-09-06. User authorized all five plans, GPT Luna executors, logical
 |---|---|---|
 | 001 | DONE | Revision addressed authorization/cancel/caption test gaps and locked runtime installation. Supervisor independently passed 34 tests and all tooling. [CI run 33956758383](https://github.com/afshinheydarali/onlinesdhop/actions/runs/33956758383) passed on both supported Python versions. |
 | 002 | DONE | 26ec2a6 and 066f16d bind actions to draft/revision/snapshot, refresh replaced photos, isolate same-user updates. Supervisor passed 44 tests, Ruff, mypy and pip check; [CI run 33958733669](https://github.com/afshinheydarali/onlinesdhop/actions/runs/33958733669) succeeded on the pushed commit. |
-| 003 | IN PROGRESS | Luna executor resumed delivery recovery against approved 066f16d. |
-| 004 | IN PROGRESS | Verified FastAPI/auth/order-service and importer I1 merged at a30b06c. Supervisor passed 62 combined tests on PostgreSQL plus Alembic check, Ruff, mypy for order_bot and pip check. Import I2, bot adapter, worker and deployment gates remain. |
+| 003 | DONE | Delivery recovery through b8a60ec adds best-effort acknowledgement, owner-scoped pagination, restart persistence, explicit ambiguous reconciliation and fenced concurrent/partial retries. Supervisor independently passed 69 bot tests plus Ruff, mypy and pip check. |
+| 004 | IN PROGRESS | FastAPI/auth/order-service and the complete transactional importer are integrated. After delivery/import integration, the supervisor passed 91 combined tests on PostgreSQL plus Alembic check, Ruff, mypy for order_bot and pip check. Bot adapter, worker and deployment gates remain. |
 | 005 | TODO | Commerce, worker, sandbox payment, operations and portfolio deliverables depend on verified 004. |
 
 ## Local verification infrastructure
@@ -39,4 +39,4 @@ The executor must only reset explicitly configured disposable test databases. Pa
 
 Commit a30b06c is pushed. Local combined verification passed 62 tests, but GitHub Actions run 34036645859 failed because the previously approved CI still installs the bot-only lock and therefore cannot import FastAPI or SQLAlchemy. A Luna-authored infrastructure patch exists uncommitted in its isolated worktree; review found its proposed expanded Ruff/mypy commands also fail against unformatted migrations and incomplete backend annotations. It was not integrated. The package must be revised and proven in CI before claiming a green foundation.
 
-All three Luna executor turns then failed with the workspace response `out of credits`. No unreviewed source was merged to conceal this blocker. Work can resume from the preserved branches/worktrees after executor capacity is restored.
+The temporary executor-credit blocker was cleared by the workspace owner. Delivery recovery and final importer acceptance resumed and passed independent review. The CI/deployment package is active in the architecture worktree; the GitHub run remains red until that verified package is integrated.
