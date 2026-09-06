@@ -142,6 +142,11 @@ def immutable_admin(row: dict[str, Any]) -> dict[str, Any]:
 
 def immutable_order(row: dict[str, Any]) -> dict[str, Any]:
     values = {field: row[field] for field in ORDER_FIELDS}
+    if values["delivery_status"] == "sending" or (
+        values["delivery_status"] == "failed"
+        and str(values["delivery_error"] or "").casefold().startswith("ambiguous")
+    ):
+        values["delivery_status"] = "ambiguous"
     values["created_at"] = parse_utc(values["created_at"], "order.created_at")
     values["delivered_at"] = parse_utc(values["delivered_at"], "order.delivered_at")
     return values
@@ -151,8 +156,13 @@ def outbox_values(row: dict[str, Any]) -> dict[str, Any] | None:
     status = row["delivery_status"]
     if status == "sent":
         return None
+    if status == "sending" or (
+        status == "failed"
+        and str(row["delivery_error"] or "").casefold().startswith("ambiguous")
+    ):
+        status = "ambiguous"
     return {
-        "status": "ambiguous" if status in {"sending", "ambiguous"} else status,
+        "status": status,
         "attempts": row["delivery_attempts"],
         # Outbox is an operational projection; keep the complete legacy error
         # only on orders.delivery_error and avoid copying possible PII here.
