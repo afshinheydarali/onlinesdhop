@@ -225,5 +225,5 @@ class StockMovement(Base):
     __table_args__ = (
         CheckConstraint("quantity > 0", name="ck_stock_movements_quantity_positive"),
         CheckConstraint("movement_type IN ('reserve','release','consume','adjust')", name="ck_stock_movements_type"),
-        Index("uq_stock_movement_order_product_type", "order_id", "product_id", "movement_type", unique=True),
+        UniqueConstraint("order_id", "product_id", "movement_type", name="uq_stock_movement_order_product_type"),
     )

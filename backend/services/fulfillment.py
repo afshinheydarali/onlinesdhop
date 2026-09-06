@@ -16,6 +16,7 @@ from backend.models import (
     PaymentAttempt,
     Reservation,
     StockMovement,
+    User,
 )
 from backend.services.orders import Actor
 
@@ -50,6 +51,14 @@ class FulfillmentService:
 
     def __init__(self, session: AsyncSession):
         self.session = session
+
+    async def _authorize(self, actor: Actor, *, allow_warehouse: bool = True) -> None:
+        allowed = OPERATIONAL_ROLES if allow_warehouse else frozenset({"owner", "manager"})
+        if actor.role not in allowed:
+            raise PermissionError("fulfillment operation is not permitted")
+        user = await self.session.scalar(select(User).where(User.id == actor.user_id, User.is_active.is_(True)))
+        if user is None or user.role != actor.role or user.telegram_id != actor.telegram_id:
+            raise PermissionError("actor is not active")
 
     async def _locked_order(self, public_id: str) -> Order:
         order = await self.session.scalar(select(Order).where(Order.public_id == public_id).with_for_update())
@@ -92,8 +101,7 @@ class FulfillmentService:
             )
 
     async def transition(self, public_id: str, target: str, actor: Actor, reason: str, *, at: datetime | None = None) -> TransitionResult:
-        if actor.role not in OPERATIONAL_ROLES:
-            raise PermissionError("fulfillment transition is not permitted")
+        await self._authorize(actor)
         if target not in FULFILLMENT_GRAPH:
             raise InvalidFulfillmentTransition("unknown fulfillment state")
         if not reason.strip() or len(reason) > 500:
@@ -109,6 +117,8 @@ class FulfillmentService:
         if target in {"cancelled", "expired"}:
             if actor.role == "warehouse" and target == "cancelled":
                 raise PermissionError("warehouse cannot cancel orders")
+            if actor.role == "warehouse" and target == "expired":
+                raise PermissionError("warehouse cannot expire orders")
             if current == "shipped":
                 raise InvalidFulfillmentTransition("shipped orders cannot be cancelled")
             if target == "expired":
@@ -171,6 +181,9 @@ class FulfillmentService:
         return await self.transition(public_id, "cancelled", actor, reason)
 
     async def expire_order(self, public_id: str, actor: Actor, *, at: datetime | None = None, reason: str = "reservation expired") -> TransitionResult:
+        await self._authorize(actor, allow_warehouse=False)
+        if not reason.strip() or len(reason) > 500:
+            raise ValueError("reason is required")
         moment = _now(at)
         order = await self.session.scalar(select(Order).where(Order.public_id == public_id).with_for_update())
         if order is None:
@@ -219,9 +232,7 @@ class FulfillmentService:
         existing = None
         if provider_event_id is not None:
             existing = await self.session.scalar(
-                select(PaymentAttempt)
-                .where(PaymentAttempt.provider == provider, PaymentAttempt.provider_event_id == provider_event_id)
-                .with_for_update()
+                select(PaymentAttempt).where(PaymentAttempt.provider == provider, PaymentAttempt.provider_event_id == provider_event_id).with_for_update()
             )
         if existing is None and provider_transaction_id is not None:
             existing = await self.session.scalar(
@@ -336,12 +347,8 @@ class ReportService:
         query = select(Order).where(*page_filters).order_by(Order.id).limit(limit)
         rows = list((await self.session.scalars(query)).all())
         report_filters = list(filters)
-        total = await self.session.scalar(
-            select(func.coalesce(func.sum(Order.amount), 0)).where(*report_filters)
-        )
-        order_count = await self.session.scalar(
-            select(func.count(Order.id)).where(*report_filters)
-        )
+        total = await self.session.scalar(select(func.coalesce(func.sum(Order.amount), 0)).where(*report_filters))
+        order_count = await self.session.scalar(select(func.count(Order.id)).where(*report_filters))
         return {
             "currency": "IRR",
             "order_count": int(order_count or 0),

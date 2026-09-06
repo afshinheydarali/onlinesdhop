@@ -111,11 +111,14 @@ class FulfillmentPGTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_expiry_releases_once(self) -> None:
         from backend.models import Reservation
-        from backend.services.fulfillment import FulfillmentService
+        from backend.services.fulfillment import FulfillmentService, InvalidFulfillmentTransition
         from backend.services.orders import Actor
 
         public_id = await self.order("expiry")
         async with self.sf() as session:
+            with self.assertRaises(InvalidFulfillmentTransition):
+                await FulfillmentService(session).expire_order(public_id, Actor(self.owner_id, "owner"))
+            await session.rollback()
             reservation = await session.scalar(select(Reservation))
             reservation.expires_at = datetime.now(UTC) - timedelta(minutes=1)
             await session.commit()
@@ -125,6 +128,25 @@ class FulfillmentPGTests(unittest.IsolatedAsyncioTestCase):
             second = await service.expire_order(public_id, Actor(self.owner_id, "owner"), at=datetime.now(UTC))
             self.assertTrue(first.changed)
             self.assertFalse(second.changed)
+
+    async def test_paid_cancellation_requires_reconciliation_without_refund(self) -> None:
+        from backend.models import Order, PaymentAttempt
+        from backend.services.fulfillment import FulfillmentService
+        from backend.services.orders import Actor
+
+        public_id = await self.order("paid-cancel")
+        async with self.sf() as session:
+            order = await session.scalar(select(Order).where(Order.public_id == public_id))
+            order.payment_status = "paid"
+            session.add(PaymentAttempt(order_id=order.id, amount=order.amount, currency="IRR", status="succeeded", provider="fake"))
+            await session.commit()
+        async with self.sf() as session:
+            await FulfillmentService(session).cancel_order(public_id, Actor(self.owner_id, "owner"), "customer changed mind")
+        async with self.sf() as session:
+            order = await session.scalar(select(Order).where(Order.public_id == public_id))
+            self.assertTrue(order.reconciliation_required)
+            self.assertEqual(order.payment_status, "paid")
+            self.assertNotEqual(order.payment_status, "refunded")
 
 
 if __name__ == "__main__":
