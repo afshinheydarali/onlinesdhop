@@ -19,7 +19,7 @@ from typing import Any
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.models import Order, PaymentAttempt, PaymentEvent
+from backend.models import Order, PaymentAttempt, PaymentEvent, Reservation
 
 
 class PaymentError(ValueError):
@@ -162,7 +162,7 @@ class PaymentService:
             raise PaymentError("order amount is unknown")
         if payload["amount"] != order.amount:
             raise PaymentError("payment amount does not match order")
-        expected_currency = (order.payment_currency or "IRR").upper()
+        expected_currency = (order.currency or "IRR").upper()
         if payload["currency"].upper() != expected_currency:
             raise PaymentError("payment currency does not match order")
 
@@ -183,12 +183,27 @@ class PaymentService:
 
         now = datetime.now(UTC)
         late_reason: str | None = None
+        reservations = list(
+            (
+                await self.session.scalars(
+                    select(Reservation).where(Reservation.order_id == order.id).with_for_update()
+                )
+            ).all()
+        )
         if order.fulfillment_status in {"cancelled", "expired"}:
             late_reason = "order_" + order.fulfillment_status
         elif order.expires_at is not None and order.expires_at <= now:
             # Expiry wins while holding the same order lock used by the expiry
             # process. Keep the order's existing lifecycle state intact and
             # make the late-money decision visible to reconciliation.
+            late_reason = "reservation_expired_before_payment"
+            if order.fulfillment_status in {"draft", "confirmed"}:
+                order.fulfillment_status = "expired"
+        elif any(
+            reservation.status in {"released", "expired"}
+            or (reservation.expires_at is not None and reservation.expires_at <= now)
+            for reservation in reservations
+        ):
             late_reason = "reservation_expired_before_payment"
             if order.fulfillment_status in {"draft", "confirmed"}:
                 order.fulfillment_status = "expired"

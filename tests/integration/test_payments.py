@@ -44,8 +44,8 @@ class PaymentPostgresTests(unittest.IsolatedAsyncioTestCase):
                 public_id="ORD-PAYMENT-1", created_by_id=user.id, customer_name="Customer",
                 phone_raw="0912", phone_normalized="98912", province="Tehran", city="Tehran",
                 address="Street", product_raw="Widget", product_normalized="widget", quantity=1,
-                amount=1000, notes=None, photo_file_id="", draft_token="payment-draft",
-                created_at=datetime.now(UTC), payment_currency="IRR", payment_status="pending",
+                amount=1000, currency="IRR", notes=None, photo_file_id="", draft_token="payment-draft",
+                created_at=datetime.now(UTC), payment_status="pending",
                 fulfillment_status="confirmed", delivery_status="pending", delivery_attempts=0,
             )
             session.add(order)

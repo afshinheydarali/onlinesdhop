@@ -62,7 +62,7 @@ class OutboxPostgresTests(unittest.IsolatedAsyncioTestCase):
                 province="Tehran", city="Tehran", address="Street", product_raw="Widget",
                 product_normalized="widget", quantity=1, amount=1000, photo_file_id="photo", draft_token="outbox-draft",
                 created_at=datetime.now(UTC), delivery_status="pending", delivery_attempts=0,
-                payment_status="pending", payment_currency="IRR", fulfillment_status="confirmed",
+                currency="IRR", payment_status="pending", fulfillment_status="confirmed",
             )
             session.add(order)
             await session.flush()
