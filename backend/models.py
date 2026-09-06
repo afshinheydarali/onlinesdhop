@@ -2,7 +2,19 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -35,8 +47,12 @@ class Order(Base):
     __tablename__ = "orders"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     public_id: Mapped[str] = mapped_column(String(40), unique=True)
-    admin_telegram_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("admins.telegram_id"), nullable=True)
-    created_by_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=True)
+    admin_telegram_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("admins.telegram_id"), nullable=True
+    )
+    created_by_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("users.id"), nullable=True
+    )
     customer_name: Mapped[str] = mapped_column(Text)
     phone_raw: Mapped[str] = mapped_column(Text)
     phone_normalized: Mapped[str] = mapped_column(Text)
@@ -50,7 +66,9 @@ class Order(Base):
     amount: Mapped[int | None] = mapped_column(BigInteger)
     notes: Mapped[str | None] = mapped_column(Text)
     photo_file_id: Mapped[str] = mapped_column(Text)
-    duplicate_of: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("orders.id"))
+    duplicate_of: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("orders.id")
+    )
     draft_token: Mapped[str] = mapped_column(String(128), unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     delivery_status: Mapped[str] = mapped_column(String(20), default="pending")
@@ -61,9 +79,19 @@ class Order(Base):
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
         CheckConstraint("quantity > 0", name="ck_orders_quantity_positive"),
-        CheckConstraint("amount IS NULL OR amount >= 0", name="ck_orders_amount_nonnegative"),
-        CheckConstraint("delivery_status IN ('pending','sending','sent','failed','ambiguous')", name="ck_orders_delivery_status"),
-        Index("ix_orders_duplicate", "phone_normalized", "product_normalized", "created_at"),
+        CheckConstraint(
+            "amount IS NULL OR amount >= 0", name="ck_orders_amount_nonnegative"
+        ),
+        CheckConstraint(
+            "delivery_status IN ('pending','sending','sent','failed','ambiguous')",
+            name="ck_orders_delivery_status",
+        ),
+        Index(
+            "ix_orders_duplicate",
+            "phone_normalized",
+            "product_normalized",
+            "created_at",
+        ),
     )
 
 
@@ -75,13 +103,17 @@ class IdempotencyKey(Base):
     key: Mapped[str] = mapped_column(String(200))
     payload_hash: Mapped[str] = mapped_column(String(64))
     order_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("orders.id"))
-    __table_args__ = (UniqueConstraint("actor_id", "operation", "key", name="uq_idempotency_scope"),)
+    __table_args__ = (
+        UniqueConstraint("actor_id", "operation", "key", name="uq_idempotency_scope"),
+    )
 
 
 class Outbox(Base):
     __tablename__ = "outbox"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    order_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("orders.id"), unique=True)
+    order_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("orders.id"), unique=True
+    )
     status: Mapped[str] = mapped_column(String(20), default="pending")
     worker_id: Mapped[str | None] = mapped_column(String(120))
     claim_token: Mapped[str | None] = mapped_column(String(64), unique=True)
