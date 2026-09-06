@@ -160,22 +160,56 @@ class PostgresBotAdapterTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as session:
             session.add(PgUser(id=1002, telegram_id=101, username="telegram-other", password_hash="!", role="seller", is_active=True, token_version=0))
             session.add(PgAdmin(telegram_id=101, name="Other", admin_code="OTHER", is_active=True, created_at=datetime.now(UTC)))
+            session.add(PgUser(id=1004, telegram_id=104, username="telegram-inactive", password_hash="!", role="seller", is_active=False, token_version=1))
+            session.add(PgAdmin(telegram_id=104, name="Inactive", admin_code="INACTIVE", is_active=False, created_at=datetime.now(UTC)))
+            for owner, public_id, status in (
+                (100, "ORD-CALLER-FAILED", "failed"),
+                (101, "ORD-FOREIGN-PENDING", "pending"),
+                (104, "ORD-INACTIVE-AMBIG", "ambiguous"),
+            ):
+                session.add(Order(
+                    public_id=public_id, admin_telegram_id=owner,
+                    customer_name="Synthetic", phone_raw=f"0912{owner}", phone_normalized=f"98912{owner}",
+                    province="Tehran", city="Tehran", address="Synthetic address", postal_code=None,
+                    product_raw="SKU-RECOVERY", product_normalized="sku-recovery", quantity=1, amount=None,
+                    notes=None, photo_file_id="photo-recovery", duplicate_of=None,
+                    draft_token=f"draft-{public_id}", created_at=datetime.now(UTC),
+                    delivery_status=status, delivery_attempts=2 if status == "failed" else 0,
+                    delivery_error="manual reconciliation" if status == "ambiguous" else None,
+                ))
             await session.commit()
         # A fresh dispatcher must read only the caller's durable queue.
         fresh = Dispatcher(storage=MemoryStorage())
         fresh.include_router(create_router())
         await fresh.feed_update(self.bot, self.update(40, text_value="/recovery"), db=self.persistence, config=self.config)
-        self.assertTrue(any("ORD-" in getattr(method, "text", "") for method in self.transport.methods))
-        self.assertFalse(any("Other" in getattr(method, "text", "") for method in self.transport.methods))
+        recovery_texts = [getattr(method, "text", "") for method in self.transport.methods]
+        self.assertTrue(any("ORD-CALLER" in value for value in recovery_texts))
+        self.assertFalse(any(identifier in value for value in recovery_texts for identifier in ("ORD-FOREIGN", "ORD-INACTIVE")))
         async with self.sessions() as session:
-            order = await session.scalar(select(Order))
+            order = await session.scalar(select(Order).where(Order.public_id == "ORD-CALLER-FAILED"))
             order.delivery_status = "ambiguous"
             order.delivery_error = "manual reconciliation"
             await session.commit()
         await fresh.feed_update(self.bot, self.update(41, text_value="/recovery"), db=self.persistence, config=self.config)
         self.assertTrue(any("نیازمند بررسی دستی" in getattr(method, "text", "") for method in self.transport.methods))
-        self.assertFalse(await self.persistence.claim_delivery(1))
-        self.assertFalse(any(method.__class__.__name__ == "SendPhoto" and getattr(method, "chat_id", None) == -1001 for method in self.transport.methods))
+        caller = await self.persistence.get_order("ORD-CALLER-FAILED", admin_id=100)
+        self.assertIsNotNone(caller)
+        attempts = caller["delivery_attempts"]
+        callback_user = User(id=100, is_bot=False, first_name="Seller")
+        callback_message = Message(message_id=42, date=0, chat=Chat(id=100, type="private"), from_user=callback_user)
+        retry = CallbackQuery(id="retry", from_user=callback_user, chat_instance="x", message=callback_message, data="retry:ORD-CALLER-FAILED")
+        await fresh.feed_update(self.bot, Update(update_id=42, callback_query=retry), db=self.persistence, config=self.config)
+        reconcile = CallbackQuery(id="reconcile", from_user=callback_user, chat_instance="x", message=callback_message, data="reconcile:ORD-CALLER-FAILED")
+        await fresh.feed_update(self.bot, Update(update_id=43, callback_query=reconcile), db=self.persistence, config=self.config)
+        current = await self.persistence.get_order("ORD-CALLER-FAILED", admin_id=100)
+        self.assertEqual((current["delivery_status"], current["delivery_attempts"]), ("ambiguous", attempts))
+        channel_methods = [
+            method for method in self.transport.methods
+            if getattr(method, "chat_id", None) == -1001
+            and method.__class__.__name__ in {"SendPhoto", "SendMessage"}
+        ]
+        self.assertFalse(channel_methods)
+        self.assertTrue(any("worker" in getattr(method, "text", "") or "بررسی دستی" in getattr(method, "text", "") for method in self.transport.methods))
 
     async def test_admin_disable_is_atomic_and_enable_does_not_restore_user(self) -> None:
         await self.persistence.set_admin_active(100, False)
