@@ -17,7 +17,11 @@ def upgrade() -> None:
         ("stock_movements", "ck_stock_movements_type", "movement_type IN ('reserve','release','consume','adjust')"),
     ]:
         op.execute(f"DO $$ BEGIN ALTER TABLE {table} ADD CONSTRAINT {name} CHECK ({expression}); EXCEPTION WHEN duplicate_object THEN NULL; END $$")
-    op.execute("DO $$ BEGIN ALTER TABLE stock_movements ADD CONSTRAINT uq_stock_movement_order_product_type UNIQUE (order_id, product_id, movement_type); EXCEPTION WHEN duplicate_object THEN NULL; END $$")
+    op.execute(
+        "DO $$ BEGIN ALTER TABLE stock_movements ADD CONSTRAINT "
+        "uq_stock_movement_order_product_type UNIQUE (order_id, product_id, movement_type); "
+        "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+    )
 
 
 def downgrade() -> None:
