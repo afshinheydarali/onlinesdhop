@@ -231,15 +231,20 @@ class OrderService:
             raise ValueError("duplicate SKU")
         if not command.idempotency_key.strip() or len(command.idempotency_key) > 200:
             raise ValueError("idempotency key is required")
+        normalized_skus = tuple((x.sku.strip().upper(), x.quantity) for x in command.items)
+        if any(not sku or len(sku) > 80 for sku, _ in normalized_skus):
+            raise ValueError("invalid SKU")
+        if len({sku for sku, _ in normalized_skus}) != len(normalized_skus):
+            raise ValueError("duplicate SKU")
         canonical = {
             "customer_name": clean_text(command.customer_name, maximum=120, field="customer_name"),
             "phone_raw": command.phone_raw.strip(),
             "province": clean_text(command.province, maximum=80, field="province"),
             "city": clean_text(command.city, maximum=80, field="city"),
             "address": clean_text(command.address, maximum=600, field="address"),
-            "postal_code": command.postal_code,
-            "items": sorted((x.sku, x.quantity) for x in command.items),
-            "notes": command.notes,
+            "postal_code": command.postal_code.strip() if command.postal_code else None,
+            "items": sorted(normalized_skus),
+            "notes": clean_text(command.notes, maximum=1000, field="notes") if command.notes else None,
         }
         payload_hash = hashlib.sha256(json.dumps(canonical, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         scope_key = int.from_bytes(
@@ -259,7 +264,7 @@ class OrderService:
                 raise RuntimeError("idempotency record has no order")
             await self.session.commit()
             return CreateOrderResult(existing, False)
-        skus = sorted(x.sku for x in command.items)
+        skus = sorted(sku for sku, _ in normalized_skus)
         products = list(
             (
                 await self.session.scalars(select(Product).where(Product.sku.in_(skus), Product.is_active.is_(True)).order_by(Product.sku).with_for_update())
@@ -281,13 +286,13 @@ class OrderService:
         by_product = {b.product_id: b for b in balances}
         lines = []
         total = 0
-        for item in command.items:
-            product, balance = by_sku[item.sku], by_product.get(by_sku[item.sku].id)
-            if balance is None or balance.on_hand - balance.reserved < item.quantity:
+        for sku, quantity in normalized_skus:
+            product, balance = by_sku[sku], by_product.get(by_sku[sku].id)
+            if balance is None or balance.on_hand - balance.reserved < quantity:
                 raise ValueError("insufficient stock")
-            line_total = product.unit_price * item.quantity
+            line_total = product.unit_price * quantity
             total += line_total
-            lines.append((item, product, balance, line_total))
+            lines.append((sku, quantity, product, balance, line_total))
         if total > 10**15:
             raise ValueError("order total is too large")
         now = datetime.now(UTC)
@@ -305,10 +310,10 @@ class OrderService:
             postal_code=canonical["postal_code"],
             product_raw="[catalog]",
             product_normalized="[catalog]",
-            quantity=sum(x.quantity for x in command.items),
+            quantity=sum(x[1] for x in normalized_skus),
             amount=total,
             currency="IRR",
-            notes=command.notes,
+            notes=canonical["notes"],
             photo_file_id="",
             draft_token=uuid.uuid4().hex,
             created_at=now,
@@ -320,8 +325,8 @@ class OrderService:
         self.session.add(
             IdempotencyKey(actor_id=actor.user_id, operation="create_cart_order", key=command.idempotency_key, payload_hash=payload_hash, order_id=order.id)
         )
-        for item, product, balance, line_total in lines:
-            balance.reserved += item.quantity
+        for sku, quantity, product, balance, line_total in lines:
+            balance.reserved += quantity
             self.session.add(
                 OrderItem(
                     order_id=order.id,
@@ -330,12 +335,12 @@ class OrderService:
                     name_snapshot=product.name,
                     unit_price_snapshot=product.unit_price,
                     currency_snapshot=product.currency,
-                    quantity=item.quantity,
+                    quantity=quantity,
                     line_total=line_total,
                 )
             )
-            self.session.add(Reservation(order_id=order.id, product_id=product.id, quantity=item.quantity, status="reserved"))
-            self.session.add(StockMovement(product_id=product.id, order_id=order.id, quantity=item.quantity, movement_type="reserve"))
+            self.session.add(Reservation(order_id=order.id, product_id=product.id, quantity=quantity, status="reserved"))
+            self.session.add(StockMovement(product_id=product.id, order_id=order.id, quantity=quantity, movement_type="reserve"))
         self.session.add(Outbox(order_id=order.id, status="pending", attempts=0, next_attempt_at=now))
         try:
             await self.session.commit()

@@ -149,6 +149,7 @@ class InventoryBalance(Base):
     __table_args__ = (
         CheckConstraint("on_hand >= 0", name="ck_inventory_on_hand_nonnegative"),
         CheckConstraint("reserved >= 0", name="ck_inventory_reserved_nonnegative"),
+        CheckConstraint("reserved <= on_hand", name="ck_inventory_reserved_lte_on_hand"),
     )
 
 
@@ -159,8 +160,10 @@ class Reservation(Base):
     product_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("products.id"))
     quantity: Mapped[int] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(20), default="reserved")
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
         CheckConstraint("quantity > 0", name="ck_reservations_quantity_positive"),
+        CheckConstraint("status IN ('reserved','released','consumed','expired')", name="ck_reservations_status"),
         UniqueConstraint("order_id", "product_id", name="uq_reservation_order_product"),
     )
 
@@ -173,3 +176,8 @@ class StockMovement(Base):
     quantity: Mapped[int] = mapped_column(Integer)
     movement_type: Mapped[str] = mapped_column(String(30))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (
+        CheckConstraint("quantity > 0", name="ck_stock_movements_quantity_positive"),
+        CheckConstraint("movement_type IN ('reserve','release','consume','adjust')", name="ck_stock_movements_type"),
+        UniqueConstraint("order_id", "product_id", "movement_type", name="uq_stock_movement_order_product_type"),
+    )
