@@ -13,7 +13,8 @@ python -m scripts.import_sqlite --source backup.sqlite --destination postgresql+
 ```
 
 `--dry-run` validates every source row and checks destination conflicts and
-repeat-run projections using read-only SQL, then prints counts without writing
+repeat-run projections by executing the same explicit-ID writes inside a
+transaction that is always rolled back; it prints counts without writing
 destination data or changing sequences. The import transaction rolls back all
 admins, users, orders and outbox rows if any validation or destination conflict
 occurs. Existing rows must match every preserved source field; a changed field
