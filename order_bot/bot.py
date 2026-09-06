@@ -49,7 +49,7 @@ class ChannelAccessError(RuntimeError):
 class PersistenceMiddleware(BaseMiddleware):
     """Adapt legacy synchronous test/import fixtures once at the adapter edge."""
 
-    async def __call__(self, handler, event, data):
+    async def __call__(self, handler: Any, event: Any, data: dict[str, Any]) -> Any:
         database = data.get("db")
         if isinstance(database, Database):
             data["db"] = SQLitePersistence(database)
@@ -735,7 +735,6 @@ async def validate_channel(bot: Bot, config: Config) -> None:
 async def run() -> None:
     config = Config.from_env()
     logging.basicConfig(level=config.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    db = Database(config.database_path, config.duplicate_window_days)
     db: AsyncPersistence
     if config.database_url:
         from backend.db import SessionFactory
