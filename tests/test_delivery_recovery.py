@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.methods import TelegramMethod
-from aiogram.types import CallbackQuery, Chat, Message, Update, User
+from aiogram.types import CallbackQuery, Chat, Message, PhotoSize, Update, User
 
 from order_bot.bot import create_dispatcher, publish_order
 from order_bot.config import Config
@@ -156,3 +156,111 @@ class DeliveryRecoveryRoutedTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_page_is_safe(self):
         await self.feed("/recovery")
         self.assertTrue(True)
+
+
+class R1RecoveryAcceptanceTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.path = str(Path(self.temp.name) / "orders.sqlite3")
+        self.db = Database(self.path)
+        self.db.initialize()
+        self.db.add_admin(100, "Seller", "A1")
+        self.db.add_admin(101, "Other", "A2")
+        self.config = Config("123:token", 999, -1001, self.path)
+        self.session = RecordingSession()
+        self.bot = Bot(self.config.bot_token, session=self.session)
+        self.dispatcher = create_dispatcher()
+
+    async def asyncTearDown(self):
+        await self.bot.session.close()
+        self.temp.cleanup()
+
+    async def feed(self, update, dispatcher=None, db=None):
+        await (dispatcher or self.dispatcher).feed_update(self.bot, update, db=db or self.db, config=self.config)
+
+    def message(self, uid, text=None, *, photo=False, caption=None, message_id=1):
+        return Message(
+            message_id=message_id,
+            date=0,
+            chat=Chat(id=uid, type="private"),
+            from_user=User(id=uid, is_bot=False, first_name="Seller"),
+            text=text,
+            caption=caption,
+            photo=[PhotoSize(file_id="photo-1", file_unique_id="unique", width=10, height=10)] if photo else None,
+        )
+
+    def callback(self, data, *, uid=100):
+        return CallbackQuery(
+            id="callback",
+            from_user=User(id=uid, is_bot=False, first_name="Seller"),
+            chat_instance="chat",
+            message=Message(
+                message_id=1000,
+                date=0,
+                chat=Chat(id=100, type="private"),
+                from_user=User(id=999, is_bot=True, first_name="Bot"),
+            ),
+            data=data,
+        )
+
+    def caption(self):
+        return "نام: علی رضایی\nتلفن: 09121234567\nاستان: تهران\nشهر: تهران\nآدرس: خیابان نمونه\nمحصول: SKU-1\nتعداد: 1"
+
+    async def confirm_from_real_preview(self, error):
+        await self.feed(Update(update_id=1, message=self.message(100, "ثبت سفارش جدید")))
+        await self.feed(Update(update_id=2, message=self.message(100, photo=True, caption=self.caption())))
+        preview = next(method for method in reversed(self.session.methods) if method.__class__.__name__ == "SendPhoto")
+        callback_data = preview.reply_markup.inline_keyboard[0][0].callback_data
+        self.session.error = error
+        before = len(self.session.methods)
+        self.assertIsNone(self.db.get_order_by_id(1))
+        self.assertFalse(any(method.__class__.__name__ == "SendPhoto" and method.chat_id == -1001 for method in self.session.methods[before:]))
+        await self.feed(Update(update_id=3, callback_query=self.callback(callback_data)))
+        order = self.db.get_order_by_id(1)
+        self.assertIsNotNone(order)
+        self.assertEqual(order["delivery_status"], "sent")
+        self.assertEqual(sum(method.__class__.__name__ == "SendPhoto" and method.chat_id == -1001 for method in self.session.methods), 1)
+
+    async def test_r1_confirm_ack_bad_request_after_real_preview(self):
+        await self.confirm_from_real_preview(TelegramBadRequest(SimpleNamespace(__api_method__="answerCallbackQuery"), "query too old"))
+
+    async def test_r1_confirm_ack_network_error_after_real_preview(self):
+        await self.confirm_from_real_preview(TelegramNetworkError(SimpleNamespace(__api_method__="answerCallbackQuery"), "network"))
+
+    async def test_r1_pagination_bot_authored_next_back_and_malformed(self):
+        own = []
+        for token in range(11):
+            result = self.db.save_order(100, draft(f"r1-{token}"), allow_duplicate=True)
+            own.append(result.order)
+        foreign = self.db.save_order(101, draft("foreign-r1"), allow_duplicate=True).order
+        await self.feed(Update(update_id=1, message=self.message(100, "/recovery")))
+        first = [m for m in self.session.methods if getattr(m, "text", None)][-1]
+        self.assertEqual(sum(ref["public_id"] in first.text for ref in own), 10)
+        self.assertNotIn(foreign["public_id"], first.text)
+        next_data = next(button.callback_data for row in first.reply_markup.inline_keyboard for button in row if button.callback_data == "recovery:1")
+        before = len(self.session.methods)
+        await self.feed(Update(update_id=2, callback_query=self.callback(next_data)))
+        emitted = [m for m in self.session.methods[before:] if getattr(m, "text", None)]
+        self.assertEqual(len(emitted), 1)
+        self.assertIn(own[10]["public_id"], emitted[0].text)
+        self.assertNotIn(foreign["public_id"], emitted[0].text)
+        back = next(button.callback_data for row in emitted[0].reply_markup.inline_keyboard for button in row if button.callback_data == "recovery:0")
+        await self.feed(Update(update_id=3, callback_query=self.callback(back)))
+        before = len(self.session.methods)
+        await self.feed(Update(update_id=4, callback_query=self.callback("recovery:999999999999999999999999999999999999")))
+        self.assertTrue(any("صفحه نامعتبر" in getattr(m, "text", "") for m in self.session.methods[before:]))
+
+    async def test_r1_recovery_mid_form_and_fresh_database_dispatcher(self):
+        row = self.db.save_order(100, draft("r1-mid"), allow_duplicate=True).order
+        await self.feed(Update(update_id=1, message=self.message(100, "ثبت سفارش جدید")))
+        state = self.dispatcher.fsm.get_context(bot=self.bot, chat_id=100, user_id=100)
+        self.assertEqual(await state.get_state(), "OrderForm:customer_name")
+        before = len(self.session.methods)
+        await self.feed(Update(update_id=2, message=self.message(100, "/recovery")))
+        self.assertIn(row["public_id"], " ".join(getattr(m, "text", "") for m in self.session.methods[before:]))
+        self.assertEqual(await state.get_state(), "OrderForm:customer_name")
+        reopened = Database(self.path)
+        fresh = create_dispatcher()
+        self.session.methods.clear()
+        await self.feed(Update(update_id=3, message=self.message(100, "/recovery")), dispatcher=fresh, db=reopened)
+        self.assertIn(row["public_id"], " ".join(getattr(m, "text", "") for m in self.session.methods))

@@ -601,6 +601,9 @@ def create_router() -> Router:
         except ValueError:
             await best_effort_callback_answer(callback, "صفحه نامعتبر است.", show_alert=True)
             return
+        if page > 1_000_000:
+            await best_effort_callback_answer(callback, "صفحه نامعتبر است.", show_alert=True)
+            return
         await best_effort_callback_answer(callback)
         await send_recovery_page(callback.message, db, admin.telegram_id, page)
 
