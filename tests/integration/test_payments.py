@@ -6,7 +6,9 @@ import asyncio
 import os
 import unittest
 from datetime import UTC, datetime, timedelta
+from unittest.mock import patch
 
+import httpx
 from sqlalchemy import func, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -112,6 +114,27 @@ class PaymentPostgresTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(getattr(result, "status", None) == "duplicate" for result in results), 1)
         async with self.sf() as session:
             self.assertEqual(await session.scalar(select(func.count()).select_from(PaymentAttempt)), 1)
+
+    async def test_http_callback_authenticates_exact_raw_bytes(self) -> None:
+        from backend.api.app import app
+        from backend.services.payments import FakeGateway
+
+        raw = self.raw(event="http-event", tx="http-transaction")
+        signature = FakeGateway.sign(raw, self.secret)
+        with patch.dict(os.environ, {"FAKE_PAYMENT_HMAC_SECRET": self.secret}), patch("backend.api.app.SessionFactory", self.sf):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                response = await client.post(
+                    "/api/v1/payments/fake/callback",
+                    content=raw + b" ",
+                    headers={"X-Fake-Gateway-Signature": signature},
+                )
+                self.assertEqual(response.status_code, 401)
+                response = await client.post(
+                    "/api/v1/payments/fake/callback",
+                    content=raw,
+                    headers={"X-Fake-Gateway-Signature": signature},
+                )
+                self.assertEqual(response.status_code, 200)
 
     async def test_late_payment_is_reconciliation_and_order_stays_expired(self) -> None:
         from backend.models import Order
