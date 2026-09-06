@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from backend.auth import (
     hash_password_async,
@@ -44,25 +44,25 @@ class Strict(BaseModel):
 
 
 class OrderIn(Strict):
-    customer_name: str
-    phone_raw: str
-    province: str
-    city: str
-    address: str
-    postal_code: str | None = None
-    product_raw: str
+    customer_name: str = Field(min_length=1, max_length=120)
+    phone_raw: str = Field(min_length=1, max_length=30)
+    province: str = Field(min_length=1, max_length=80)
+    city: str = Field(min_length=1, max_length=80)
+    address: str = Field(min_length=1, max_length=600)
+    postal_code: str | None = Field(default=None, max_length=30)
+    product_raw: str = Field(min_length=1, max_length=200)
     quantity: int = Field(gt=0, le=100000)
     amount: int | None = Field(default=None, ge=0)
-    notes: str | None = None
-    photo_file_id: str = ""
+    notes: str | None = Field(default=None, max_length=1000)
+    photo_file_id: str = Field(default="", max_length=500)
     idempotency_key: str = Field(min_length=1, max_length=200)
     allow_duplicate: bool = False
 
 
 class AdminIn(Strict):
-    telegram_id: int = Field(gt=0)
-    name: str
-    admin_code: str
+    telegram_id: int = Field(gt=0, le=2**63 - 1)
+    name: str = Field(min_length=1, max_length=120)
+    admin_code: str = Field(min_length=1, max_length=32)
 
 
 class ActiveIn(Strict):
@@ -93,6 +93,11 @@ class OrderOut(Strict):
 class Token(Strict):
     access_token: str
     token_type: str
+
+
+class OrderPage(Strict):
+    items: list[OrderOut]
+    next_cursor: int | None = None
 
 
 def output(order, actor):
@@ -205,21 +210,18 @@ async def get_order(
         return output(order, actor)
 
 
-@app.get(
-    "/api/v1/orders", response_model=list[OrderOut], response_model_exclude_none=True
-)
+@app.get("/api/v1/orders", response_model=OrderPage, response_model_exclude_none=True)
 async def list_orders(
     limit: int = Query(50, ge=1, le=100),
     cursor: int | None = Query(None, ge=1),
     actor: Actor = Depends(require("owner", "manager", "seller", "warehouse")),  # noqa: B008
 ):
     async with SessionFactory() as s:
-        return [
-            output(o, actor)
-            for o in await OrderService(s).list_orders(
-                actor, limit=limit, cursor=cursor
-            )
-        ]
+        orders = await OrderService(s).list_orders(actor, limit=limit, cursor=cursor)
+        return OrderPage(
+            items=[output(o, actor) for o in orders],
+            next_cursor=orders[-1].id if len(orders) == limit else None,
+        )
 
 
 @app.post("/api/v1/admins", status_code=201)
@@ -305,9 +307,16 @@ async def set_admin(
 
 
 @app.get("/api/v1/users")
-async def list_users(actor: Actor = Depends(require("owner"))):  # noqa: B008
+async def list_users(
+    limit: int = Query(50, ge=1, le=100),
+    cursor: int | None = Query(None, ge=1),
+    actor: Actor = Depends(require("owner")),  # noqa: B008
+):
     async with SessionFactory() as s:
-        users = (await s.scalars(select(User).order_by(User.id))).all()
+        query = select(User).order_by(User.id).limit(limit)
+        if cursor is not None:
+            query = query.where(User.id > cursor)
+        users = (await s.scalars(query)).all()
         return [
             {
                 "id": u.id,
@@ -330,7 +339,7 @@ async def ready():
     try:
         async with SessionFactory() as s:
             await s.execute(select(1))
-    except (OSError, RuntimeError):
+    except (OSError, SQLAlchemyError):
         raise HTTPException(503, "database unavailable")
     return {"status": "ok"}
 

@@ -1,6 +1,7 @@
 import os
 import unittest
 from datetime import UTC, datetime, timedelta
+from unittest.mock import patch
 
 import httpx
 import jwt
@@ -60,12 +61,12 @@ class APIAuthTests(unittest.IsolatedAsyncioTestCase):
             await s.flush()
             self.seller_id = users[1].id
             await s.commit()
-        import backend.api.app as api_module
-        import backend.auth as auth_module
         from backend.api.app import app
 
-        api_module.SessionFactory = self.sf
-        auth_module.SessionFactory = self.sf
+        self.api_factory_patch = patch("backend.api.app.SessionFactory", self.sf)
+        self.auth_factory_patch = patch("backend.auth.SessionFactory", self.sf)
+        self.api_factory_patch.start()
+        self.auth_factory_patch.start()
 
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -73,6 +74,8 @@ class APIAuthTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await self.client.aclose()
+        self.auth_factory_patch.stop()
+        self.api_factory_patch.stop()
         await self.engine.dispose()
 
     async def test_auth_validation_and_seller_privacy(self):

@@ -64,6 +64,18 @@ class OrderService:
         self.session = session
         self.duplicate_window_days = duplicate_window_days
 
+    async def _active_actor(self, actor: Actor) -> User:
+        user = await self.session.scalar(
+            select(User).where(User.id == actor.user_id, User.is_active.is_(True))
+        )
+        if (
+            user is None
+            or user.role != actor.role
+            or user.telegram_id != actor.telegram_id
+        ):
+            raise PermissionError("actor is not active")
+        return user
+
     async def create_order(
         self, command: CreateOrderCommand, actor: Actor
     ) -> CreateOrderResult:
@@ -85,13 +97,7 @@ class OrderService:
             raise ValueError("idempotency key is required")
         if len(command.phone_raw) > 30 or len(command.photo_file_id) > 500:
             raise ValueError("input field too long")
-        active = await self.session.scalar(
-            select(User).where(User.id == actor.user_id, User.is_active.is_(True))
-        )
-        if active is None or active.role != actor.role:
-            raise PermissionError("actor is not active")
-        if active.telegram_id != actor.telegram_id:
-            raise PermissionError("actor identity mismatch")
+        await self._active_actor(actor)
         if actor.telegram_id is not None:
             admin = await self.session.scalar(
                 select(Admin).where(
@@ -230,6 +236,7 @@ class OrderService:
     async def get_order(self, public_id: str, actor: Actor) -> Order | None:
         if actor.role not in {"owner", "manager", "seller", "warehouse"}:
             raise PermissionError("unknown role")
+        await self._active_actor(actor)
         query = select(Order).where(Order.public_id == public_id)
         if actor.role == "seller":
             query = query.where(Order.created_by_id == actor.user_id)
@@ -240,6 +247,7 @@ class OrderService:
     ) -> list[Order]:
         if actor.role not in {"owner", "manager", "seller", "warehouse"}:
             raise PermissionError("unknown role")
+        await self._active_actor(actor)
         limit = max(1, min(limit, 100))
         query = select(Order).order_by(Order.id.desc()).limit(limit)
         if actor.role == "seller":
