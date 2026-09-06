@@ -24,7 +24,9 @@ Legacy admins map to disabled-login seller users by Telegram ID. Existing
 orders retain their numeric IDs and all nullable/customer, delivery, message,
 duplicate and timestamp fields. `pending` and `failed` deliveries create
 corresponding outbox recovery rows; `sending` becomes `ambiguous` for manual
-reconciliation; `sent` is never replayed.
+reconciliation. A failed row whose error starts with `Ambiguous ` is also
+mapped to `ambiguous` in both the order and outbox; ordinary failed rows remain
+manually retryable. `sent` is never replayed.
 
 Run the importer again to verify idempotence: matching rows are reported as
 already present and no additional rows or delivery jobs are created. Sequence

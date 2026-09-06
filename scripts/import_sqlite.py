@@ -166,11 +166,16 @@ def immutable_order(row: dict[str, Any]) -> dict[str, Any]:
     values = {field: row[field] for field in ORDER_FIELDS}
     values["created_at"] = parse_utc(values["created_at"], "order.created_at")
     values["delivered_at"] = parse_utc(values["delivered_at"], "order.delivered_at")
+    if values["delivery_status"] == "sending" or (
+        values["delivery_status"] == "failed"
+        and str(values["delivery_error"] or "").startswith("Ambiguous ")
+    ):
+        values["delivery_status"] = "ambiguous"
     return values
 
 
 def outbox_values(row: dict[str, Any]) -> dict[str, Any] | None:
-    status = row["delivery_status"]
+    status = immutable_order(row)["delivery_status"]
     if status == "sent":
         return None
     return {

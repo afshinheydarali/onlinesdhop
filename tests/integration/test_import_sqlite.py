@@ -190,7 +190,7 @@ class ImporterIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 )
             ).all()
             self.assertEqual(
-                rows, [(20, 30, "pending"), (30, None, "sending"), (40, None, "sent")]
+                rows, [(20, 30, "pending"), (30, None, "ambiguous"), (40, None, "sent")]
             )
             self.assertEqual(
                 (
@@ -208,6 +208,170 @@ class ImporterIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 ).one(),
                 ("ambiguous", "legacy_delivery_error"),
             )
+            preserved = (
+                await c.execute(
+                    text(
+                        "SELECT amount, notes, photo_file_id, channel_photo_message_id, "
+                        "channel_text_message_id, delivered_at, created_by_id FROM orders WHERE id=40"
+                    )
+                )
+            ).one()
+            self.assertEqual(preserved[:5], (None, None, "file", 21, 22))
+            self.assertEqual(preserved[5].isoformat(), "2026-01-04T00:00:00+00:00")
+            self.assertEqual(preserved[6], 1)
+
+    async def test_later_database_constraint_rolls_back_earlier_rows(self):
+        c = sqlite3.connect(self.source)
+        c.execute("DELETE FROM orders")
+        rows = [
+            (
+                20,
+                "V20",
+                7,
+                "N",
+                "r",
+                "n20",
+                "p",
+                "c",
+                "a",
+                None,
+                "x",
+                "x",
+                1,
+                None,
+                None,
+                "f",
+                None,
+                "v20",
+                "2026-01-01T00:00:00+00:00",
+                "sent",
+                0,
+                None,
+                1,
+                2,
+                "2026-01-01T00:00:00+00:00",
+            ),
+            (
+                30,
+                "V30",
+                7,
+                "N",
+                "r",
+                "n30",
+                "p",
+                "c",
+                "a",
+                None,
+                "x",
+                "x",
+                1,
+                None,
+                None,
+                "f",
+                None,
+                "v30",
+                "2026-01-01T00:00:00+00:00",
+                "sent",
+                0,
+                None,
+                3,
+                4,
+                "2026-01-01T00:00:00+00:00",
+            ),
+            (
+                40,
+                "V40",
+                7,
+                "N",
+                "r",
+                "n40",
+                "p",
+                "c",
+                "a",
+                None,
+                "x",
+                "x",
+                2147483648,
+                None,
+                None,
+                "f",
+                None,
+                "v40",
+                "2026-01-01T00:00:00+00:00",
+                "sent",
+                0,
+                None,
+                5,
+                6,
+                "2026-01-01T00:00:00+00:00",
+            ),
+        ]
+        c.executemany("INSERT INTO orders VALUES (" + ",".join("?" * 25) + ")", rows)
+        c.commit()
+        c.close()
+        with self.assertRaises(Exception):
+            await run(self.source, DB_URL, False)
+        self.assertEqual(
+            await self.counts(), {"users": 0, "admins": 0, "orders": 0, "outbox": 0}
+        )
+
+    async def test_repeat_conflict_rolls_back_new_lower_id(self):
+        await run(self.source, DB_URL, False)
+        async with self.engine.connect() as connection:
+            before = (
+                await connection.execute(
+                    text(
+                        "SELECT id, public_id, customer_name, address, delivery_status, created_at FROM orders ORDER BY id"
+                    )
+                )
+            ).all()
+        c = sqlite3.connect(self.source)
+        c.execute(
+            "INSERT INTO orders VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                10,
+                "P10",
+                7,
+                "new",
+                "r",
+                "n10",
+                "p",
+                "c",
+                "new",
+                None,
+                "x",
+                "x",
+                1,
+                None,
+                None,
+                "f",
+                None,
+                "t10",
+                "2026-01-05T00:00:00+00:00",
+                "sent",
+                0,
+                None,
+                7,
+                8,
+                "2026-01-05T00:00:00+00:00",
+            ),
+        )
+        c.execute(
+            "UPDATE orders SET customer_name='changed', address='changed' WHERE id=30"
+        )
+        c.commit()
+        c.close()
+        with self.assertRaises(ValueError):
+            await run(self.source, DB_URL, False)
+        async with self.engine.connect() as connection:
+            after = (
+                await connection.execute(
+                    text(
+                        "SELECT id, public_id, customer_name, address, delivery_status, created_at FROM orders ORDER BY id"
+                    )
+                )
+            ).all()
+        self.assertEqual(after, before)
 
     async def test_dry_run_rolls_back_and_invalid_source_rolls_back(self):
         self.assertEqual(await run(self.source, DB_URL, True), 0)
@@ -235,6 +399,60 @@ class ImporterIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await self.counts(), {"users": 1, "admins": 1, "orders": 3, "outbox": 2}
         )
+
+    async def test_ordinary_failed_remains_manual_retryable(self):
+        c = sqlite3.connect(self.source)
+        c.execute(
+            "UPDATE orders SET delivery_status='failed', delivery_error='network' WHERE id=20"
+        )
+        c.commit()
+        c.close()
+        await run(self.source, DB_URL, False)
+        async with self.engine.connect() as connection:
+            self.assertEqual(
+                (
+                    await connection.execute(
+                        text("SELECT delivery_status FROM orders WHERE id=20")
+                    )
+                ).scalar_one(),
+                "failed",
+            )
+            self.assertEqual(
+                (
+                    await connection.execute(
+                        text("SELECT status,error_code FROM outbox WHERE order_id=20")
+                    )
+                ).one(),
+                ("failed", "legacy_delivery_error"),
+            )
+
+    async def test_ambiguous_failure_maps_order_and_outbox(self):
+        c = sqlite3.connect(self.source)
+        c.execute(
+            "UPDATE orders SET delivery_status='failed', delivery_error='Ambiguous Telegram timeout' WHERE id=30"
+        )
+        c.commit()
+        c.close()
+        await run(self.source, DB_URL, False)
+        async with self.engine.connect() as connection:
+            self.assertEqual(
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT delivery_status, delivery_error, amount, channel_photo_message_id, channel_text_message_id FROM orders WHERE id=30"
+                        )
+                    )
+                ).one(),
+                ("ambiguous", "Ambiguous Telegram timeout", 5, 11, 12),
+            )
+            self.assertEqual(
+                (
+                    await connection.execute(
+                        text("SELECT status, attempts FROM outbox WHERE order_id=30")
+                    )
+                ).one(),
+                ("ambiguous", 3),
+            )
 
     async def test_dry_run_enforces_unique_public_id(self):
         await run(self.source, DB_URL, False)
