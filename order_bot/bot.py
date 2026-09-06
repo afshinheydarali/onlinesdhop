@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType, ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -36,6 +36,7 @@ CANCEL = "لغو"
 BACK = "بازگشت"
 RESTART = "شروع مجدد"
 SKIP = "رد کردن"
+RECOVERY_PAGE_SIZE = 10
 MAX_CAPTION_LENGTH = 1024
 MAX_MESSAGE_LENGTH = 4096
 
@@ -105,6 +106,44 @@ def preview_keyboard(token: str, revision: int, *, duplicate: bool = False) -> I
 
 def retry_keyboard(public_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="تلاش مجدد ارسال", callback_data=f"retry:{public_id}")]])
+
+
+def reconcile_keyboard(public_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="تأیید بررسی دستی و تلاش مجدد", callback_data=f"reconcile:{public_id}")]]
+    )
+
+
+def recovery_keyboard(rows: list[dict[str, Any]], page: int, has_next: bool) -> InlineKeyboardMarkup:
+    def status_label(row: dict[str, Any]) -> str:
+        if row["delivery_status"] == "pending":
+            return "در انتظار ارسال"
+        if "Ambiguous" in str(row.get("delivery_error", "")):
+            return "نیازمند بررسی دستی"
+        return "ارسال ناموفق"
+
+    buttons = [
+        [InlineKeyboardButton(
+            text=f"{row['public_id']} — {status_label(row)}",
+            callback_data=f"retry:{row['public_id']}",
+        )]
+        for row in rows
+    ]
+    navigation: list[InlineKeyboardButton] = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton(text="قبلی", callback_data=f"recovery:{page - 1}"))
+    if has_next:
+        navigation.append(InlineKeyboardButton(text="بعدی", callback_data=f"recovery:{page + 1}"))
+    if navigation:
+        buttons.append(navigation)
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def best_effort_callback_answer(callback: CallbackQuery, *args: Any, **kwargs: Any) -> None:
+    try:
+        await callback.answer(*args, **kwargs)
+    except (TelegramBadRequest, TelegramNetworkError, TelegramServerError, TelegramRetryAfter):
+        LOGGER.warning("Telegram callback acknowledgement failed; continuing order processing")
 
 
 def _event_user_and_chat(event: Message | CallbackQuery) -> tuple[int | None, str | None]:
@@ -196,8 +235,8 @@ def render_order_html(order: dict[str, Any], admin: Admin, timezone: str) -> str
     )
 
 
-async def publish_order(bot: Bot, db: Database, config: Config, order: dict[str, Any], admin: Admin) -> bool:
-    if not db.claim_delivery(order["id"]):
+async def publish_order(bot: Bot, db: Database, config: Config, order: dict[str, Any], admin: Admin, *, allow_ambiguous: bool = False) -> bool:
+    if not db.claim_delivery(order["id"], allow_ambiguous=allow_ambiguous):
         current = db.get_order_by_id(order["id"])
         return bool(current and current["delivery_status"] == "sent")
     text = render_order_html(order, admin, config.app_timezone)
@@ -418,9 +457,6 @@ def create_router() -> Router:
         else:
             await prompt_step(message, state, index + 1)
 
-    for _, step_state, _, _ in STEPS[:-1]:
-        router.message(step_state)(collect_text)
-
     async def validate_preview_action(callback: CallbackQuery, state: FSMContext, db: Database) -> tuple[Admin, dict[str, Any], str] | None:
         admin = await authorized_admin(callback, state, db)
         if not admin or not callback.data:
@@ -511,14 +547,17 @@ def create_router() -> Router:
         if not result.created:
             current = db.get_order_by_id(order["id"])
             await clear_current_draft(state, token, revision)
-            await callback.answer("این سفارش قبلاً پردازش شده است.", show_alert=True)
-            if current and current["delivery_status"] == "failed":
+            await best_effort_callback_answer(callback, "این سفارش قبلاً پردازش شده است.", show_alert=True)
+            if current and current["delivery_status"] in ("pending", "failed"):
+                delivery_label = "در انتظار ارسال" if current["delivery_status"] == "pending" else "ارسال ناموفق"
                 await callback.message.answer(
-                    f"سفارش {order['public_id']} ذخیره شده ولی ارسال آن ناموفق بوده است.",
+                    f"سفارش {order['public_id']} ذخیره شده ({delivery_label}) و قابل بازیابی است.",
                     reply_markup=retry_keyboard(order["public_id"]),
                 )
+            elif current and current["delivery_status"] == "sending":
+                await callback.message.answer(f"ارسال سفارش {order['public_id']} در حال انجام است.")
             return
-        await callback.answer("در حال ارسال…")
+        await best_effort_callback_answer(callback, "در حال ارسال…")
         sent = await publish_order(cast(Bot, callback.bot), db, config, order, admin)
         await clear_current_draft(state, token, revision)
         if sent:
@@ -529,6 +568,52 @@ def create_router() -> Router:
                 reply_markup=retry_keyboard(order["public_id"]),
             )
 
+    async def send_recovery_page(message: Message, db: Database, admin_id: int, page: int) -> None:
+        rows = db.list_recoverable_orders(admin_id, limit=RECOVERY_PAGE_SIZE + 1, offset=page * RECOVERY_PAGE_SIZE)
+        has_next = len(rows) > RECOVERY_PAGE_SIZE
+        rows = rows[:RECOVERY_PAGE_SIZE]
+        if not rows:
+            await message.answer("ارسال معوقی برای بازیابی پیدا نشد.")
+            return
+
+        def line(row: dict[str, Any]) -> str:
+            if row["delivery_status"] == "pending":
+                label = "در انتظار ارسال"
+            elif "Ambiguous" in str(row.get("delivery_error", "")):
+                label = "نیازمند بررسی دستی"
+            else:
+                label = "ارسال ناموفق"
+            return f"{row['public_id']} — {label}"
+
+        await message.answer(
+            "سفارش‌های نیازمند بازیابی (فقط شماره و وضعیت):\n" +
+            "\n".join(line(row) for row in rows),
+            reply_markup=recovery_keyboard(rows, page, has_next),
+        )
+
+    @router.callback_query(F.data.startswith("recovery:"))
+    async def recovery_page(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+        admin = await authorized_admin(callback, state, db)
+        if not admin or not isinstance(callback.message, Message) or not callback.data:
+            return
+        try:
+            page = max(0, int(callback.data.split(":", 1)[1]))
+        except ValueError:
+            await best_effort_callback_answer(callback, "صفحه نامعتبر است.", show_alert=True)
+            return
+        if page > 1_000_000:
+            await best_effort_callback_answer(callback, "صفحه نامعتبر است.", show_alert=True)
+            return
+        await best_effort_callback_answer(callback)
+        await send_recovery_page(callback.message, db, admin.telegram_id, page)
+
+    @router.message(Command("recovery"))
+    @router.message(Command("delivery_recovery"))
+    async def recovery(message: Message, state: FSMContext, db: Database) -> None:
+        if not (admin := await authorized_admin(message, state, db)):
+            return
+        await send_recovery_page(message, db, admin.telegram_id, 0)
+
     @router.callback_query(F.data.startswith("retry:"))
     async def retry(callback: CallbackQuery, state: FSMContext, db: Database, config: Config) -> None:
         admin = await authorized_admin(callback, state, db)
@@ -538,10 +623,45 @@ def create_router() -> Router:
         if not order:
             await callback.answer("سفارش قابل‌دسترسی نیست.", show_alert=True)
             return
+        if "Ambiguous" in str(order.get("delivery_error", "")):
+            await best_effort_callback_answer(callback, "این ارسال نیازمند تأیید بررسی دستی است.", show_alert=True)
+            if isinstance(callback.message, Message):
+                await callback.message.answer(
+                    f"نتیجه ارسال سفارش {order['public_id']} نامشخص است؛ پس از بررسی کانال، اقدام را تأیید کنید.",
+                    reply_markup=reconcile_keyboard(order["public_id"]),
+                )
+            return
         sent = await publish_order(cast(Bot, callback.bot), db, config, order, admin)
-        await callback.answer("ارسال شد." if sent else "ارسال دوباره ناموفق بود.", show_alert=True)
+        current = db.get_order_by_id(order["id"])
+        if sent:
+            status_message = "ارسال شد."
+        elif current and current["delivery_status"] == "sending":
+            status_message = "ارسال این سفارش در حال انجام است."
+        else:
+            status_message = "ارسال دوباره ناموفق بود."
+        await best_effort_callback_answer(callback, status_message, show_alert=True)
         if sent:
             await callback.message.answer(f"سفارش {order['public_id']} ارسال شد.", reply_markup=main_keyboard())
+
+    @router.callback_query(F.data.startswith("reconcile:"))
+    async def reconcile(callback: CallbackQuery, state: FSMContext, db: Database, config: Config) -> None:
+        admin = await authorized_admin(callback, state, db)
+        if not admin or not isinstance(callback.message, Message) or not callback.data:
+            return
+        public_id = callback.data.removeprefix("reconcile:")
+        order = db.get_order(public_id, admin_id=admin.telegram_id)
+        if not order or "Ambiguous" not in str(order.get("delivery_error", "")):
+            await best_effort_callback_answer(callback, "سفارش برای بررسی دستی قابل‌دسترسی نیست.", show_alert=True)
+            return
+        await best_effort_callback_answer(callback, "تلاش دستی آغاز شد.", show_alert=True)
+        sent = await publish_order(cast(Bot, callback.bot), db, config, order, admin, allow_ambiguous=True)
+        await callback.message.answer(
+            f"سفارش {public_id} {'ارسال شد.' if sent else 'در صف بررسی باقی ماند.'}",
+            reply_markup=main_keyboard() if sent else retry_keyboard(public_id),
+        )
+
+    for _, step_state, _, _ in STEPS[:-1]:
+        router.message(step_state)(collect_text)
 
     return router
 

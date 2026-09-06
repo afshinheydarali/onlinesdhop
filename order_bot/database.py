@@ -189,12 +189,31 @@ class Database:
             row = connection.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
         return dict(row) if row else None
 
-    def claim_delivery(self, order_id: int) -> bool:
+    def list_recoverable_orders(self, admin_id: int, *, limit: int = 10, offset: int = 0) -> list[dict[str, Any]]:
+        """Return the caller's bounded delivery work queue.
+
+        The query deliberately excludes sent orders and is owner-scoped in SQL.
+        Callers should only expose ``public_id`` and ``delivery_status`` from the
+        returned rows; the full rows are used internally when retrying delivery.
+        """
+        limit = max(1, min(limit, 50))
+        offset = max(0, offset)
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """SELECT * FROM orders
+                   WHERE admin_telegram_id = ? AND delivery_status IN ('pending', 'failed')
+                   ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?""",
+                (admin_id, limit, offset),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def claim_delivery(self, order_id: int, *, allow_ambiguous: bool = False) -> bool:
         with closing(self._connect()) as connection:
             cursor = connection.execute(
                 """UPDATE orders SET delivery_status = 'sending', delivery_attempts = delivery_attempts + 1,
-                   delivery_error = NULL WHERE id = ? AND delivery_status IN ('pending', 'failed')""",
-                (order_id,),
+                   delivery_error = NULL WHERE id = ? AND delivery_status IN ('pending', 'failed')
+                   AND (delivery_error IS NULL OR delivery_error NOT LIKE 'Ambiguous %' OR ?)""",
+                (order_id, allow_ambiguous),
             )
         return cursor.rowcount == 1
 
@@ -224,6 +243,7 @@ class Database:
         with closing(self._connect()) as connection:
             cursor = connection.execute(
                 """UPDATE orders SET delivery_status = 'failed',
-                   delivery_error = 'Process interrupted during delivery' WHERE delivery_status = 'sending'"""
+                   delivery_error = 'Ambiguous delivery after process interruption; manual reconciliation required'
+                   WHERE delivery_status = 'sending'"""
             )
         return cursor.rowcount
