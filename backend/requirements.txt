@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+sqlalchemy>=2.0
+asyncpg
+alembic
+PyJWT
+pwdlib[argon2]
+httpx
+python-multipart
