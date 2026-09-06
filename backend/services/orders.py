@@ -296,7 +296,7 @@ class OrderService:
         if total > 10**15:
             raise ValueError("order total is too large")
         now = datetime.now(UTC)
-        phone = normalize_phone(canonical["phone_raw"])
+        phone = normalize_phone(command.phone_raw.strip())
         order = Order(
             public_id=f"ORD-{now:%Y%m%d}-{uuid.uuid4().hex[:8].upper()}",
             admin_telegram_id=actor.telegram_id,
