@@ -60,6 +60,7 @@ def _hash(command: CreateOrderCommand) -> str:
 
 
 class OrderService:
+    MAX_DELIVERY_ATTEMPTS = 5
     def __init__(self, session: AsyncSession, duplicate_window_days: int = 30):
         self.session = session
         self.duplicate_window_days = duplicate_window_days
@@ -268,7 +269,7 @@ class OrderService:
         )
         if (
             row is None
-            or row.status in {"sent", "ambiguous", "failed"}
+            or row.status in {"sent", "ambiguous"}
             or (row.lease_expires_at and row.lease_expires_at > now)
         ):
             await self.session.rollback()
@@ -291,7 +292,7 @@ class OrderService:
         if row.next_attempt_at and row.next_attempt_at > now:
             await self.session.rollback()
             return None
-        if row.attempts >= 5:
+        if row.attempts >= self.MAX_DELIVERY_ATTEMPTS:
             row.status = "failed"
             row.error_code = "attempt_limit"
             await self.session.commit()
@@ -303,6 +304,53 @@ class OrderService:
         )
         await self.session.commit()
         return row
+
+    async def mark_photo_sent(
+        self, order_id: int, claim_token: str, photo_message_id: int
+    ) -> None:
+        """Fence and persist the first Telegram operation before sending text."""
+        row = await self.session.scalar(
+            select(Outbox)
+            .where(Outbox.order_id == order_id, Outbox.claim_token == claim_token)
+            .with_for_update()
+        )
+        if row is None or row.status != "sending":
+            raise ValueError("invalid delivery claim")
+        order = await self.session.get(Order, order_id)
+        if order is None:
+            raise ValueError("order not found")
+        if order.channel_photo_message_id is None:
+            order.channel_photo_message_id = photo_message_id
+        await self.session.commit()
+
+    async def mark_delivery_ambiguous(
+        self, order_id: int, claim_token: str, error_code: str = "telegram_timeout"
+    ) -> None:
+        row = await self.session.scalar(
+            select(Outbox)
+            .where(Outbox.order_id == order_id, Outbox.claim_token == claim_token)
+            .with_for_update()
+        )
+        if row is None or row.status != "sending":
+            raise ValueError("invalid delivery claim")
+        row.status, row.error_code, row.lease_expires_at = "ambiguous", error_code[:120], None
+        order = await self.session.get(Order, order_id)
+        if order:
+            order.delivery_status, order.delivery_error = "ambiguous", error_code[:500]
+        await self.session.commit()
+
+    async def reconcile_ambiguous_delivery(self, order_id: int) -> None:
+        """Explicit operator action to make an ambiguous job retryable."""
+        row = await self.session.scalar(
+            select(Outbox).where(Outbox.order_id == order_id).with_for_update()
+        )
+        if row is None or row.status != "ambiguous":
+            raise ValueError("delivery is not ambiguous")
+        row.status, row.error_code, row.next_attempt_at = "pending", None, datetime.now(UTC)
+        order = await self.session.get(Order, order_id)
+        if order:
+            order.delivery_status, order.delivery_error = "pending", None
+        await self.session.commit()
 
     async def mark_delivery_sent(
         self,
