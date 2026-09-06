@@ -72,6 +72,10 @@ class Order(Base):
     channel_photo_message_id: Mapped[int | None] = mapped_column(BigInteger)
     channel_text_message_id: Mapped[int | None] = mapped_column(BigInteger)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    fulfillment_status: Mapped[str] = mapped_column(String(20), default="draft", server_default="draft")
+    payment_status: Mapped[str] = mapped_column(String(20), default="pending", server_default="pending")
+    reconciliation_required: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    expired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
         CheckConstraint("quantity > 0", name="ck_orders_quantity_positive"),
         CheckConstraint("amount IS NULL OR amount >= 0", name="ck_orders_amount_nonnegative"),
@@ -79,12 +83,22 @@ class Order(Base):
             "delivery_status IN ('pending','sending','sent','failed','ambiguous')",
             name="ck_orders_delivery_status",
         ),
+        CheckConstraint(
+            "fulfillment_status IN ('draft','confirmed','packing','shipped','delivered','cancelled','expired')",
+            name="ck_orders_fulfillment_status",
+        ),
+        CheckConstraint(
+            "payment_status IN ('pending','paid','failed','refunded')",
+            name="ck_orders_payment_status",
+        ),
         Index(
             "ix_orders_duplicate",
             "phone_normalized",
             "product_normalized",
             "created_at",
         ),
+        Index("ix_orders_fulfillment_status_created", "fulfillment_status", "created_at", "id"),
+        Index("ix_orders_payment_report", "payment_status", "reconciliation_required", "created_at", "id"),
     )
 
 
@@ -168,6 +182,38 @@ class Reservation(Base):
     )
 
 
+class FulfillmentTransition(Base):
+    __tablename__ = "fulfillment_transitions"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    order_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("orders.id", ondelete="CASCADE"))
+    actor_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=True)
+    actor_role: Mapped[str] = mapped_column(String(20))
+    from_status: Mapped[str] = mapped_column(String(20))
+    to_status: Mapped[str] = mapped_column(String(20))
+    reason: Mapped[str] = mapped_column(Text)
+    transitioned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (Index("ix_fulfillment_transitions_order_time", "order_id", "transitioned_at", "id"),)
+
+
+class PaymentAttempt(Base):
+    __tablename__ = "payment_attempts"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    order_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("orders.id", ondelete="CASCADE"))
+    provider: Mapped[str] = mapped_column(String(40), default="fake")
+    provider_transaction_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    provider_event_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    amount: Mapped[int] = mapped_column(BigInteger)
+    currency: Mapped[str] = mapped_column(String(3))
+    status: Mapped[str] = mapped_column(String(20))
+    payload_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_event_id", name="uq_payment_provider_event"),
+        UniqueConstraint("provider", "provider_transaction_id", name="uq_payment_provider_transaction"),
+        Index("ix_payment_attempts_order", "order_id", "created_at"),
+    )
+
+
 class StockMovement(Base):
     __tablename__ = "stock_movements"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -179,5 +225,5 @@ class StockMovement(Base):
     __table_args__ = (
         CheckConstraint("quantity > 0", name="ck_stock_movements_quantity_positive"),
         CheckConstraint("movement_type IN ('reserve','release','consume','adjust')", name="ck_stock_movements_type"),
-        UniqueConstraint("order_id", "product_id", "movement_type", name="uq_stock_movement_order_product_type"),
+        Index("uq_stock_movement_order_product_type", "order_id", "product_id", "movement_type", unique=True),
     )
