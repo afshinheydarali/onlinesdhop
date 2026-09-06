@@ -77,6 +77,11 @@ class Order(Base):
     channel_photo_message_id: Mapped[int | None] = mapped_column(BigInteger)
     channel_text_message_id: Mapped[int | None] = mapped_column(BigInteger)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Commerce/payment fields are additive to the legacy free-text order shape.
+    payment_status: Mapped[str] = mapped_column(String(24), default="pending")
+    payment_currency: Mapped[str] = mapped_column(String(3), default="IRR")
+    fulfillment_status: Mapped[str] = mapped_column(String(24), default="confirmed")
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
         CheckConstraint("quantity > 0", name="ck_orders_quantity_positive"),
         CheckConstraint(
@@ -85,6 +90,14 @@ class Order(Base):
         CheckConstraint(
             "delivery_status IN ('pending','sending','sent','failed','ambiguous')",
             name="ck_orders_delivery_status",
+        ),
+        CheckConstraint(
+            "payment_status IN ('pending','paid','failed','refunded','reconciliation')",
+            name="ck_orders_payment_status",
+        ),
+        CheckConstraint(
+            "fulfillment_status IN ('draft','confirmed','packing','shipped','delivered','cancelled','expired')",
+            name="ck_orders_fulfillment_status",
         ),
         Index(
             "ix_orders_duplicate",
@@ -121,3 +134,45 @@ class Outbox(Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_code: Mapped[str | None] = mapped_column(String(120))
+
+
+class PaymentAttempt(Base):
+    """A provider transaction and its locally verified outcome."""
+
+    __tablename__ = "payment_attempts"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    order_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("orders.id"), index=True)
+    provider: Mapped[str] = mapped_column(String(40), default="fake")
+    provider_transaction_id: Mapped[str] = mapped_column(String(160), unique=True)
+    amount: Mapped[int] = mapped_column(BigInteger)
+    currency: Mapped[str] = mapped_column(String(3))
+    status: Mapped[str] = mapped_column(String(24), default="pending")
+    reconciliation_reason: Mapped[str | None] = mapped_column(String(240))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        CheckConstraint("amount >= 0", name="ck_payment_attempt_amount_nonnegative"),
+        CheckConstraint(
+            "status IN ('pending','paid','failed','reconciliation')",
+            name="ck_payment_attempt_status",
+        ),
+    )
+
+
+class PaymentEvent(Base):
+    """Immutable provider callback receipt used for event and payload replay fencing."""
+
+    __tablename__ = "payment_events"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    provider_event_id: Mapped[str] = mapped_column(String(160), unique=True)
+    payload_fingerprint: Mapped[str] = mapped_column(String(64))
+    provider_transaction_id: Mapped[str] = mapped_column(String(160), index=True)
+    order_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("orders.id"))
+    payment_attempt_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("payment_attempts.id")
+    )
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+# Domain vocabulary used by some adapters and reports.
+PaymentWebhookEvent = PaymentEvent

@@ -24,6 +24,12 @@ from backend.services.orders import (
     IdempotencyConflict,
     OrderService,
 )
+from backend.services.payments import (
+    InvalidPaymentSignature,
+    PaymentConflict,
+    PaymentError,
+    PaymentService,
+)
 
 app = FastAPI(title="OnlineShop API", version="1.0.0")
 ROUTE_PERMISSIONS = {
@@ -33,6 +39,7 @@ ROUTE_PERMISSIONS = {
     "GET /api/v1/orders": "owner|manager|seller|warehouse",
     "POST /api/v1/admins": "owner",
     "PATCH /api/v1/admins/{telegram_id}": "owner",
+    "POST /api/v1/payments/fake/callback": "public",
     "POST /api/v1/users": "owner",
     "GET /api/v1/users": "owner",
     "PATCH /api/v1/users/{user_id}/revoke": "owner",
@@ -100,6 +107,34 @@ class Token(Strict):
 class OrderPage(Strict):
     items: list[OrderOut]
     next_cursor: int | None = None
+
+
+@app.post("/api/v1/payments/fake/callback")
+async def fake_payment_callback(request: Request) -> dict[str, Any]:
+    signature = request.headers.get(
+        "X-Fake-Gateway-Signature",
+        request.headers.get("X-Payment-Signature", request.headers.get("X-Signature", "")),
+    )
+    raw_body = await request.body()
+    async with SessionFactory() as s:
+        try:
+            result = await PaymentService(s).apply_callback(raw_body, signature)
+        except InvalidPaymentSignature as exc:
+            await s.rollback()
+            raise HTTPException(401, str(exc)) from exc
+        except PaymentConflict as exc:
+            await s.rollback()
+            raise HTTPException(409, str(exc)) from exc
+        except PaymentError as exc:
+            await s.rollback()
+            raise HTTPException(422, str(exc)) from exc
+    return {
+        "event_id": result.event_id,
+        "order_id": result.order_id,
+        "status": result.status,
+        "applied": result.applied,
+        "reconciliation_reason": result.reconciliation_reason,
+    }
 
 
 def output(order: Order, actor: Actor) -> OrderOut:
