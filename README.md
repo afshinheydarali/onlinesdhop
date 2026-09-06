@@ -4,11 +4,11 @@
 
 ## پیش‌نیازها
 
-- Python 3.10 تا 3.14 (پیشنهاد: 3.12)
+- Python 3.11 یا 3.12 (پیشنهاد: 3.12)
 - یا Docker و Docker Compose
 - یک Bot و یک کانال خصوصی Telegram
 
-نسخه پروژه روی [`aiogram 3.31.0`](https://pypi.org/project/aiogram/) ثابت شده است. این نسخه در زمان ساخت، نسخه پایدار منتشرشده و سازگار با Python 3.10 تا 3.14 است.
+نسخه پروژه روی [`aiogram 3.31.0`](https://pypi.org/project/aiogram/) ثابت شده است. وابستگی‌های کامل و نسخه‌دار در `requirements-lock.txt` ثبت شده‌اند.
 
 ## ساخت Bot و کانال
 
@@ -50,7 +50,7 @@ PowerShell:
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+python -m pip install -r requirements.txt -c requirements-lock.txt
 python -m order_bot
 ```
 
@@ -59,7 +59,7 @@ Linux/macOS:
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt -c requirements-lock.txt
 python -m order_bot
 ```
 
@@ -79,6 +79,8 @@ python -m order_bot
 ```
 
 Telegram User ID و کد ادمین هر دو یکتا هستند. غیرفعال‌سازی فوراً ادامه فرم و ثبت نهایی را مسدود می‌کند. مدیر اصلی برای ثبت سفارش باید مانند هر فروشنده با `/admin_add` به فهرست ادمین‌ها اضافه شود؛ مالک‌بودن به‌تنهایی دسترسی سفارش نمی‌دهد.
+
+دکمه‌های تأیید، ویرایش و لغو به همان پیش‌نمایش و نسخه‌ای که نمایش داده شده‌اند متصل‌اند؛ با شروع مجدد، ویرایش یا جایگزینی عکس، دکمه‌های قبلی منقضی می‌شوند.
 
 ## ثبت سفارش و قالب caption
 
@@ -105,10 +107,25 @@ Telegram User ID و کد ادمین هر دو یکتا هستند. غیرفعا�
 
 ```powershell
 python -m unittest discover -v
-python -m compileall -q order_bot tests
+python -m unittest tests.test_handlers -v
+python -m pip install -r requirements-dev.txt -c requirements-lock.txt
+ruff check order_bot tests
+mypy order_bot
+python -m pip check
 ```
 
-تست‌ها دسترسی، مدیریت و غیرفعال‌سازی ادمین، اعتبارسنجی تلفن و ارقام فارسی، caption معتبر/نامعتبر، ثبت معمولی و عکس، تکراری و تأیید دوم، عدم افشای سفارش قبلی، idempotency، کنترل‌های پیش‌نمایش، شکست/retry انتشار، تفکیک caption طولانی و HTML escaping را پوشش می‌دهند.
+برای بازسازی دقیق lock از یک محیط مجازی تازه، پس از حذف محیط قبلی این دستورات را اجرا کنید:
+
+```powershell
+Remove-Item -Recurse -Force .venv
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m pip freeze | Set-Content requirements-lock.txt
+```
+
+در Linux/macOS معادل آن `rm -rf .venv`، ساخت محیط با `python3 -m venv .venv`، نصب با `./.venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt` و تولید lock با `./.venv/bin/python -m pip freeze > requirements-lock.txt` است. نصب runtime و Docker همیشه با `requirements.txt` و قید نسخه‌های `requirements-lock.txt` انجام می‌شود.
+
+تست‌ها با unittest اجرا می‌شوند و جریان‌های مسیریابی‌شده فرم، میان‌بر caption عکس، دسترسی خصوصی و مدیر، اعتبارسنجی تلفن، تکراری و تأیید دوم، شکست/retry انتشار و تفکیک caption طولانی را پوشش می‌دهند. همین بررسی‌ها در CI برای Python 3.11 و 3.12 اجرا می‌شوند.
 
 ## اجرای Docker
 

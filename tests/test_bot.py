@@ -9,9 +9,9 @@ from aiogram.exceptions import TelegramBadRequest
 from order_bot.bot import (
     BACK,
     CANCEL,
-    ChannelAccessError,
     MAX_CAPTION_LENGTH,
     RESTART,
+    ChannelAccessError,
     authorized_admin,
     navigation_keyboard,
     owner_only,
@@ -50,11 +50,12 @@ class BotLogicTests(unittest.IsolatedAsyncioTestCase):
 
     def test_preview_supports_confirm_edit_and_cancel(self) -> None:
         callbacks = {
-            button.callback_data
-            for row in preview_keyboard().inline_keyboard
+            button.callback_data.split(":")[1]
+            for row in preview_keyboard("a" * 32, 4).inline_keyboard
             for button in row
         }
-        self.assertEqual(callbacks, {"order:confirm", "order:edit", "order:cancel"})
+        self.assertEqual(callbacks, {"c", "e", "x"})
+        self.assertTrue(all(len(button.callback_data.encode()) <= 64 for row in preview_keyboard("a" * 32, 4).inline_keyboard for button in row))
 
     def test_navigation_supports_back_restart_and_cancel(self) -> None:
         labels = {button.text for row in navigation_keyboard().keyboard for button in row}
