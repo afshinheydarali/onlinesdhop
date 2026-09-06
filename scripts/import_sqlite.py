@@ -41,7 +41,8 @@ def read_source(source: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]
     if path.with_name(path.name + "-wal").exists():
         raise ValueError("source has a live WAL; provide a consistent SQLite backup snapshot")
     before = checksum(source)
-    connection = sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True)
+    # Path.as_uri() correctly escapes Windows drive letters, spaces and '#'.
+    connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     try:
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -57,8 +58,9 @@ def read_source(source: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]
 
 def validate_source(admins: list[dict[str, Any]], orders: list[dict[str, Any]]) -> None:
     admin_ids = {row["telegram_id"] for row in admins}
+    admin_codes = {str(row["admin_code"]).casefold() for row in admins}
     order_ids = {row["id"] for row in orders}
-    if len(admin_ids) != len(admins) or len(order_ids) != len(orders):
+    if len(admin_ids) != len(admins) or len(admin_codes) != len(admins) or len(order_ids) != len(orders):
         raise ValueError("source contains duplicate primary keys")
     for row in admins:
         if row["telegram_id"] <= 0 or not row["name"] or not row["admin_code"]:
@@ -71,8 +73,10 @@ def validate_source(admins: list[dict[str, Any]], orders: list[dict[str, Any]]) 
             raise ValueError(f"order {row['id']} references unknown admin")
         if row["duplicate_of"] is not None and row["duplicate_of"] not in order_ids:
             raise ValueError(f"order {row['id']} references unknown duplicate")
-        if row["delivery_status"] not in {"pending", "sending", "sent", "failed"}:
+        if row["delivery_status"] not in {"pending", "sending", "sent", "failed", "ambiguous"}:
             raise ValueError(f"invalid delivery status for order {row['id']}")
+        if row["delivery_attempts"] is None or row["delivery_attempts"] < 0:
+            raise ValueError(f"invalid delivery attempts for order {row['id']}")
         parse_utc(row["created_at"], "order.created_at")
         parse_utc(row["delivered_at"], "order.delivered_at")
 
@@ -88,6 +92,21 @@ def immutable_order(row: dict[str, Any]) -> dict[str, Any]:
     values["delivered_at"] = parse_utc(values["delivered_at"], "order.delivered_at")
     return values
 
+def outbox_values(row: dict[str, Any]) -> dict[str, Any] | None:
+    status = row["delivery_status"]
+    if status == "sent":
+        return None
+    return {
+        "status": "ambiguous" if status in {"sending", "ambiguous"} else status,
+        "attempts": row["delivery_attempts"],
+        # Outbox is an operational projection; keep the complete legacy error
+        # only on orders.delivery_error and avoid copying possible PII here.
+        "error_code": "legacy_delivery_error" if row["delivery_error"] else None,
+    }
+
+def differs(found: Any, expected: dict[str, Any], fields: tuple[str, ...]) -> bool:
+    return any(found[field] != expected[field] for field in fields)
+
 async def reset_sequences(connection: Any) -> None:
     for table in ("users", "orders"):
         sequence = (await connection.execute(text("SELECT pg_get_serial_sequence(:table, 'id')"), {"table": table})).scalar_one()
@@ -101,40 +120,63 @@ async def run(source: str, destination: str, dry_run: bool, reset_seq: bool = Tr
     imported = 0
     try:
         async with engine.begin() as connection:
-            if dry_run:
-                print(f"source_sha256={source_hash} admins={len(admins)} orders={len(orders)} dry_run=true")
-                return 0
             admin_users: dict[int, int] = {}
+            deferred_duplicates: list[tuple[int, int]] = []
+            next_user_id = int((await connection.execute(text("SELECT COALESCE(max(id), 0) FROM users"))).scalar_one()) + 1
             for row in admins:
                 expected = immutable_admin(row)
                 found = (await connection.execute(text("SELECT telegram_id, name, admin_code, is_active, created_at FROM admins WHERE telegram_id=:id"), {"id": row["telegram_id"]})).mappings().first()
                 if found and any(found[field] != expected[field] for field in ADMIN_FIELDS):
                     raise ValueError(f"admin conflict {row['telegram_id']}")
-                if not found:
+                if not found and not dry_run:
                     await connection.execute(Admin.__table__.insert().values(**expected))
-                user = (await connection.execute(text("SELECT id, is_active, role FROM users WHERE telegram_id=:id"), {"id": row["telegram_id"]})).mappings().first()
-                if user and (bool(user["is_active"]) != bool(row["is_active"]) or user["role"] != "manager"):
+                user = (await connection.execute(text("SELECT id, telegram_id, username, password_hash, is_active, role FROM users WHERE telegram_id=:id"), {"id": row["telegram_id"]})).mappings().first()
+                if user and (bool(user["is_active"]) != bool(row["is_active"]) or user["role"] != "seller" or user["password_hash"] != DISABLED_PASSWORD_HASH):
                     raise ValueError(f"user mapping conflict {row['telegram_id']}")
                 if not user:
-                    next_id = (await connection.execute(text("SELECT COALESCE(max(id), 0) + 1 FROM users"))).scalar_one()
-                    user = (await connection.execute(User.__table__.insert().values(id=next_id, telegram_id=row["telegram_id"], username=f"legacy_{row['telegram_id']}", password_hash=DISABLED_PASSWORD_HASH, role="manager", is_active=bool(row["is_active"]), token_version=0).returning(User.id))).mappings().first()
+                    username = f"legacy_{row['telegram_id']}"
+                    occupied = (await connection.execute(text("SELECT 1 FROM users WHERE username=:username"), {"username": username})).first()
+                    if occupied:
+                        raise ValueError(f"user mapping conflict {row['telegram_id']}")
+                    user = {"id": next_user_id}
+                    if not dry_run:
+                        user = (await connection.execute(User.__table__.insert().values(id=next_user_id, telegram_id=row["telegram_id"], username=username, password_hash=DISABLED_PASSWORD_HASH, role="seller", is_active=bool(row["is_active"]), token_version=0).returning(User.id))).mappings().first()
+                    next_user_id += 1
                 admin_users[row["telegram_id"]] = int(user["id"])
             for row in orders:
                 expected = immutable_order(row)
-                found = (await connection.execute(text("SELECT " + ",".join(ORDER_FIELDS) + " FROM orders WHERE id=:id"), {"id": row["id"]})).mappings().first()
+                found = (await connection.execute(text("SELECT " + ",".join(ORDER_FIELDS) + ",created_by_id FROM orders WHERE id=:id"), {"id": row["id"]})).mappings().first()
                 if found:
-                    if any(found[field] != expected[field] for field in ORDER_FIELDS):
+                    if differs(found, expected, ORDER_FIELDS) or found["created_by_id"] != admin_users[row["admin_telegram_id"]]:
                         raise ValueError(f"order conflict {row['id']}")
+                    expected_outbox = outbox_values(row)
+                    existing_outbox = (await connection.execute(text("SELECT status, attempts, error_code FROM outbox WHERE order_id=:id"), {"id": row["id"]})).mappings().first()
+                    if expected_outbox is None and existing_outbox is not None:
+                        raise ValueError(f"outbox conflict {row['id']}")
+                    if expected_outbox is not None and (existing_outbox is None or differs(existing_outbox, expected_outbox, ("status", "attempts", "error_code"))):
+                        raise ValueError(f"outbox conflict {row['id']}")
                     continue
                 values = dict(expected)
                 values["created_by_id"] = admin_users[row["admin_telegram_id"]]
-                await connection.execute(Order.__table__.insert().values(**values))
-                status = row["delivery_status"]
-                if status in {"pending", "sending", "failed"}:
-                    await connection.execute(Outbox.__table__.insert().values(order_id=row["id"], status="ambiguous" if status == "sending" else status, attempts=row["delivery_attempts"], error_code=row["delivery_error"]))
+                if not dry_run:
+                    duplicate_of = values["duplicate_of"]
+                    # Allow a legacy duplicate to point at a later numeric ID;
+                    # the self-FK is filled after every order exists.
+                    values["duplicate_of"] = None
+                    await connection.execute(Order.__table__.insert().values(**values))
+                    if duplicate_of is not None:
+                        deferred_duplicates.append((row["id"], duplicate_of))
+                    projected = outbox_values(row)
+                    if projected is not None:
+                        await connection.execute(Outbox.__table__.insert().values(order_id=row["id"], **projected))
                 imported += 1
-            if reset_seq:
+            for order_id, duplicate_of in deferred_duplicates:
+                await connection.execute(text("UPDATE orders SET duplicate_of=:duplicate_of WHERE id=:id"), {"id": order_id, "duplicate_of": duplicate_of})
+            if reset_seq and not dry_run:
                 await reset_sequences(connection)
+            if dry_run:
+                print(f"source_sha256={source_hash} admins={len(admins)} orders={len(orders)} dry_run=true")
+                return 0
     finally:
         await engine.dispose()
     if checksum(source) != source_hash:

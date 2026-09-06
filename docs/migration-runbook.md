@@ -12,12 +12,14 @@ python -m alembic upgrade head
 python -m scripts.import_sqlite --source backup.sqlite --destination postgresql+asyncpg://.../onlineshop_import_test
 ```
 
-`--dry-run` validates every source row and prints counts without writing the
-destination. The import transaction rolls back all admins, users, orders and
-outbox rows if any validation or destination conflict occurs. Existing rows
-must match every preserved source field; a changed field aborts the run.
+`--dry-run` validates every source row and checks destination conflicts and
+repeat-run projections using read-only SQL, then prints counts without writing
+destination data or changing sequences. The import transaction rolls back all
+admins, users, orders and outbox rows if any validation or destination conflict
+occurs. Existing rows must match every preserved source field; a changed field
+or outbox projection aborts the run.
 
-Legacy admins map to disabled-login manager users by Telegram ID. Existing
+Legacy admins map to disabled-login seller users by Telegram ID. Existing
 orders retain their numeric IDs and all nullable/customer, delivery, message,
 duplicate and timestamp fields. `pending` and `failed` deliveries create
 corresponding outbox recovery rows; `sending` becomes `ambiguous` for manual
