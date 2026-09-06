@@ -32,6 +32,7 @@ class Config:
     duplicate_window_days: int = 30
     app_timezone: str = "Asia/Tehran"
     log_level: str = "INFO"
+    database_url: str | None = None
 
     @classmethod
     def from_env(cls, env_file: str | None = ".env") -> "Config":
@@ -61,4 +62,5 @@ class Config:
             duplicate_window_days=days,
             app_timezone=timezone,
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+            database_url=os.getenv("DATABASE_URL") or None,
         )

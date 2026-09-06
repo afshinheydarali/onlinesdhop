@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType, ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.filters import Command, CommandStart
@@ -28,6 +28,7 @@ from aiogram.types import (
 
 from .config import Config
 from .database import Admin, Database
+from .persistence import AsyncPersistence, PostgresPersistence, SQLitePersistence
 from .validation import CAPTION_TEMPLATE, clean_text, normalize_phone, normalize_product, parse_caption, parse_optional_amount, parse_positive_int
 
 LOGGER = logging.getLogger(__name__)
@@ -43,6 +44,16 @@ MAX_MESSAGE_LENGTH = 4096
 
 class ChannelAccessError(RuntimeError):
     pass
+
+
+class PersistenceMiddleware(BaseMiddleware):
+    """Adapt legacy synchronous test/import fixtures once at the adapter edge."""
+
+    async def __call__(self, handler, event, data):
+        database = data.get("db")
+        if isinstance(database, Database):
+            data["db"] = SQLitePersistence(database)
+        return await handler(event, data)
 
 
 class OrderForm(StatesGroup):
@@ -118,7 +129,7 @@ def recovery_keyboard(rows: list[dict[str, Any]], page: int, has_next: bool) -> 
     def status_label(row: dict[str, Any]) -> str:
         if row["delivery_status"] == "pending":
             return "در انتظار ارسال"
-        if "Ambiguous" in str(row.get("delivery_error", "")):
+        if row.get("delivery_status") == "ambiguous" or "Ambiguous" in str(row.get("delivery_error", "")):
             return "نیازمند بررسی دستی"
         return "ارسال ناموفق"
 
@@ -152,9 +163,11 @@ def _event_user_and_chat(event: Message | CallbackQuery) -> tuple[int | None, st
     return event.from_user.id if event.from_user else None, event.chat.type
 
 
-async def authorized_admin(event: Message | CallbackQuery, state: FSMContext, db: Database) -> Admin | None:
+async def authorized_admin(event: Message | CallbackQuery, state: FSMContext, db: AsyncPersistence) -> Admin | None:
+    if isinstance(db, Database):
+        db = SQLitePersistence(db)
     user_id, chat_type = _event_user_and_chat(event)
-    admin = db.get_admin(user_id) if user_id and chat_type == ChatType.PRIVATE else None
+    admin = await db.get_admin(user_id) if user_id and chat_type == ChatType.PRIVATE else None
     if admin:
         return admin
     await state.clear()
@@ -235,9 +248,13 @@ def render_order_html(order: dict[str, Any], admin: Admin, timezone: str) -> str
     )
 
 
-async def publish_order(bot: Bot, db: Database, config: Config, order: dict[str, Any], admin: Admin, *, allow_ambiguous: bool = False) -> bool:
-    if not db.claim_delivery(order["id"], allow_ambiguous=allow_ambiguous):
-        current = db.get_order_by_id(order["id"])
+async def publish_order(bot: Bot, db: AsyncPersistence, config: Config, order: dict[str, Any], admin: Admin, *, allow_ambiguous: bool = False) -> bool:
+    if isinstance(db, Database):
+        db = SQLitePersistence(db)
+    if db.postgres:
+        return False
+    if not await db.claim_delivery(order["id"], allow_ambiguous=allow_ambiguous):
+        current = await db.get_order_by_id(order["id"])
         return bool(current and current["delivery_status"] == "sent")
     text = render_order_html(order, admin, config.app_timezone)
     try:
@@ -252,17 +269,17 @@ async def publish_order(bot: Bot, db: Database, config: Config, order: dict[str,
             if not photo_message_id:
                 photo_message = await bot.send_photo(config.orders_channel_id, order["photo_file_id"])
                 photo_message_id = photo_message.message_id
-                db.mark_photo_sent(order["id"], photo_message_id)
+                await db.mark_photo_sent(order["id"], photo_message_id)
             text_message = await bot.send_message(
                 config.orders_channel_id, text, parse_mode=ParseMode.HTML, reply_to_message_id=photo_message_id
             )
             text_message_id = text_message.message_id
         assert photo_message_id is not None
-        db.mark_delivered(order["id"], photo_message_id, text_message_id)
+        await db.mark_delivered(order["id"], photo_message_id, text_message_id)
         return True
     except Exception as exc:
         LOGGER.error("Order %s delivery failed: %s", order["public_id"], type(exc).__name__)
-        db.mark_delivery_failed(order["id"], type(exc).__name__)
+        await db.mark_delivery_failed(order["id"], type(exc).__name__)
         return False
 
 
@@ -289,14 +306,17 @@ async def prompt_step(message: Message, state: FSMContext, index: int) -> None:
 
 def create_router() -> Router:
     router = Router()
+    persistence_middleware = PersistenceMiddleware()
+    router.message.outer_middleware(persistence_middleware)
+    router.callback_query.outer_middleware(persistence_middleware)
 
     @router.message(CommandStart())
-    async def start(message: Message, state: FSMContext, db: Database, config: Config) -> None:
+    async def start(message: Message, state: FSMContext, db: AsyncPersistence, config: Config) -> None:
         await state.clear()
         user_id = message.from_user.id if message.from_user else 0
         if message.chat.type != ChatType.PRIVATE:
             await message.answer("ربات را فقط در چت خصوصی استفاده کنید.")
-        elif admin := db.get_admin(user_id):
+        elif admin := await db.get_admin(user_id):
             await message.answer(f"سلام {admin.name}. برای ثبت سفارش دکمه زیر را بزنید.", reply_markup=main_keyboard())
         elif user_id == config.owner_telegram_id:
             await message.answer("پنل مدیر آماده است. برای راهنما /owner_help را بزنید.")
@@ -312,7 +332,7 @@ def create_router() -> Router:
             )
 
     @router.message(Command("admin_add"))
-    async def admin_add(message: Message, state: FSMContext, db: Database, config: Config) -> None:
+    async def admin_add(message: Message, state: FSMContext, db: AsyncPersistence, config: Config) -> None:
         if not await owner_only(message, state, config):
             return
         parts = (message.text or "").split(maxsplit=3)
@@ -320,13 +340,13 @@ def create_router() -> Router:
             await message.answer("قالب: /admin_add TELEGRAM_ID ADMIN_CODE NAME")
             return
         try:
-            admin = db.add_admin(int(parts[1]), parts[3], parts[2])
+            admin = await db.add_admin(int(parts[1]), parts[3], parts[2])
         except ValueError as exc:
             await message.answer(str(exc))
         else:
             await message.answer(f"ادمین {admin.name} با کد {admin.admin_code} افزوده شد.")
 
-    async def change_admin(message: Message, state: FSMContext, db: Database, config: Config, active: bool) -> None:
+    async def change_admin(message: Message, state: FSMContext, db: AsyncPersistence, config: Config, active: bool) -> None:
         if not await owner_only(message, state, config):
             return
         parts = (message.text or "").split()
@@ -336,24 +356,24 @@ def create_router() -> Router:
             telegram_id = 0
         if telegram_id <= 0:
             await message.answer(f"قالب: /admin_{'enable' if active else 'disable'} TELEGRAM_ID")
-        elif db.set_admin_active(telegram_id, active):
+        elif await db.set_admin_active(telegram_id, active):
             await message.answer("وضعیت ادمین به‌روزرسانی شد.")
         else:
             await message.answer("ادمین پیدا نشد.")
 
     @router.message(Command("admin_enable"))
-    async def admin_enable(message: Message, state: FSMContext, db: Database, config: Config) -> None:
+    async def admin_enable(message: Message, state: FSMContext, db: AsyncPersistence, config: Config) -> None:
         await change_admin(message, state, db, config, True)
 
     @router.message(Command("admin_disable"))
-    async def admin_disable(message: Message, state: FSMContext, db: Database, config: Config) -> None:
+    async def admin_disable(message: Message, state: FSMContext, db: AsyncPersistence, config: Config) -> None:
         await change_admin(message, state, db, config, False)
 
     @router.message(Command("admins"))
-    async def admins(message: Message, state: FSMContext, db: Database, config: Config) -> None:
+    async def admins(message: Message, state: FSMContext, db: AsyncPersistence, config: Config) -> None:
         if not await owner_only(message, state, config):
             return
-        rows = db.list_admins()
+        rows = await db.list_admins()
         lines = [f"{item.admin_code} | {item.name} | {item.telegram_id} | {'فعال' if item.is_active else 'غیرفعال'}" for item in rows]
         if not lines:
             await message.answer("هیچ ادمینی ثبت نشده است.")
@@ -369,7 +389,7 @@ def create_router() -> Router:
         await message.answer(chunk)
 
     @router.message(F.text == NEW_ORDER)
-    async def new_order(message: Message, state: FSMContext, db: Database) -> None:
+    async def new_order(message: Message, state: FSMContext, db: AsyncPersistence) -> None:
         if not await authorized_admin(message, state, db):
             return
         await state.clear()
@@ -377,14 +397,14 @@ def create_router() -> Router:
         await prompt_step(message, state, 0)
 
     @router.message(F.text == CANCEL)
-    async def cancel(message: Message, state: FSMContext, db: Database) -> None:
+    async def cancel(message: Message, state: FSMContext, db: AsyncPersistence) -> None:
         if not await authorized_admin(message, state, db):
             return
         await state.clear()
         await message.answer("سفارش لغو شد.", reply_markup=main_keyboard())
 
     @router.message(F.text == RESTART)
-    async def restart(message: Message, state: FSMContext, db: Database) -> None:
+    async def restart(message: Message, state: FSMContext, db: AsyncPersistence) -> None:
         if not await authorized_admin(message, state, db):
             return
         await state.clear()
@@ -392,7 +412,7 @@ def create_router() -> Router:
         await prompt_step(message, state, 0)
 
     @router.message(F.text == BACK)
-    async def back(message: Message, state: FSMContext, db: Database) -> None:
+    async def back(message: Message, state: FSMContext, db: AsyncPersistence) -> None:
         if not await authorized_admin(message, state, db):
             return
         current = await state.get_state()
@@ -403,7 +423,7 @@ def create_router() -> Router:
         await prompt_step(message, state, max(0, index - 1))
 
     @router.message(F.photo)
-    async def photo(message: Message, state: FSMContext, db: Database) -> None:
+    async def photo(message: Message, state: FSMContext, db: AsyncPersistence) -> None:
         if not await authorized_admin(message, state, db):
             return
         current = await state.get_state()
@@ -433,7 +453,7 @@ def create_router() -> Router:
         else:
             await message.answer("عکس دریافت شد؛ حالا اطلاعات مرحله جاری را وارد کنید.")
 
-    async def collect_text(message: Message, state: FSMContext, db: Database) -> None:
+    async def collect_text(message: Message, state: FSMContext, db: AsyncPersistence) -> None:
         if not await authorized_admin(message, state, db):
             return
         current = await state.get_state()
@@ -457,7 +477,7 @@ def create_router() -> Router:
         else:
             await prompt_step(message, state, index + 1)
 
-    async def validate_preview_action(callback: CallbackQuery, state: FSMContext, db: Database) -> tuple[Admin, dict[str, Any], str] | None:
+    async def validate_preview_action(callback: CallbackQuery, state: FSMContext, db: AsyncPersistence) -> tuple[Admin, dict[str, Any], str] | None:
         admin = await authorized_admin(callback, state, db)
         if not admin or not callback.data:
             return None
@@ -491,13 +511,13 @@ def create_router() -> Router:
             await state.clear()
 
     @router.callback_query(F.data.in_({"order:confirm", "order:confirm_duplicate", "order:edit", "order:cancel"}))
-    async def expired_legacy_action(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+    async def expired_legacy_action(callback: CallbackQuery, state: FSMContext, db: AsyncPersistence) -> None:
         if not await authorized_admin(callback, state, db):
             return
         await callback.answer("این دکمه منقضی شده است.", show_alert=True)
 
     @router.callback_query(F.data.startswith("o:"))
-    async def order_action(callback: CallbackQuery, state: FSMContext, db: Database, config: Config) -> None:
+    async def order_action(callback: CallbackQuery, state: FSMContext, db: AsyncPersistence, config: Config) -> None:
         if not isinstance(callback.message, Message):
             return
         validated = await validate_preview_action(callback, state, db)
@@ -527,7 +547,7 @@ def create_router() -> Router:
         save_data = dict(data)
         save_data.update(data["preview_snapshot"])
         try:
-            result = db.save_order(admin.telegram_id, save_data, allow_duplicate=allow_duplicate)
+            result = await db.save_order(admin.telegram_id, save_data, allow_duplicate=allow_duplicate)
         except PermissionError:
             await state.clear()
             await callback.answer("دسترسی شما فعال نیست.", show_alert=True)
@@ -545,7 +565,7 @@ def create_router() -> Router:
         if order is None:
             return
         if not result.created:
-            current = db.get_order_by_id(order["id"])
+            current = await db.get_order_by_id(order["id"])
             await clear_current_draft(state, token, revision)
             await best_effort_callback_answer(callback, "این سفارش قبلاً پردازش شده است.", show_alert=True)
             if current and current["delivery_status"] in ("pending", "failed"):
@@ -556,6 +576,14 @@ def create_router() -> Router:
                 )
             elif current and current["delivery_status"] == "sending":
                 await callback.message.answer(f"ارسال سفارش {order['public_id']} در حال انجام است.")
+            return
+        if db.postgres:
+            await clear_current_draft(state, token, revision)
+            await best_effort_callback_answer(callback, "سفارش در صف ارسال قرار گرفت.")
+            await callback.message.answer(
+                f"سفارش {order['public_id']} ثبت شد و در صف ارسال قرار گرفت.",
+                reply_markup=main_keyboard(),
+            )
             return
         await best_effort_callback_answer(callback, "در حال ارسال…")
         sent = await publish_order(cast(Bot, callback.bot), db, config, order, admin)
@@ -568,8 +596,8 @@ def create_router() -> Router:
                 reply_markup=retry_keyboard(order["public_id"]),
             )
 
-    async def send_recovery_page(message: Message, db: Database, admin_id: int, page: int) -> None:
-        rows = db.list_recoverable_orders(admin_id, limit=RECOVERY_PAGE_SIZE + 1, offset=page * RECOVERY_PAGE_SIZE)
+    async def send_recovery_page(message: Message, db: AsyncPersistence, admin_id: int, page: int) -> None:
+        rows = await db.list_recoverable_orders(admin_id, limit=RECOVERY_PAGE_SIZE + 1, offset=page * RECOVERY_PAGE_SIZE)
         has_next = len(rows) > RECOVERY_PAGE_SIZE
         rows = rows[:RECOVERY_PAGE_SIZE]
         if not rows:
@@ -579,7 +607,7 @@ def create_router() -> Router:
         def line(row: dict[str, Any]) -> str:
             if row["delivery_status"] == "pending":
                 label = "در انتظار ارسال"
-            elif "Ambiguous" in str(row.get("delivery_error", "")):
+            elif row.get("delivery_status") == "ambiguous" or "Ambiguous" in str(row.get("delivery_error", "")):
                 label = "نیازمند بررسی دستی"
             else:
                 label = "ارسال ناموفق"
@@ -592,7 +620,7 @@ def create_router() -> Router:
         )
 
     @router.callback_query(F.data.startswith("recovery:"))
-    async def recovery_page(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+    async def recovery_page(callback: CallbackQuery, state: FSMContext, db: AsyncPersistence) -> None:
         admin = await authorized_admin(callback, state, db)
         if not admin or not isinstance(callback.message, Message) or not callback.data:
             return
@@ -609,21 +637,21 @@ def create_router() -> Router:
 
     @router.message(Command("recovery"))
     @router.message(Command("delivery_recovery"))
-    async def recovery(message: Message, state: FSMContext, db: Database) -> None:
+    async def recovery(message: Message, state: FSMContext, db: AsyncPersistence) -> None:
         if not (admin := await authorized_admin(message, state, db)):
             return
         await send_recovery_page(message, db, admin.telegram_id, 0)
 
     @router.callback_query(F.data.startswith("retry:"))
-    async def retry(callback: CallbackQuery, state: FSMContext, db: Database, config: Config) -> None:
+    async def retry(callback: CallbackQuery, state: FSMContext, db: AsyncPersistence, config: Config) -> None:
         admin = await authorized_admin(callback, state, db)
         if not admin or not callback.data or not callback.message:
             return
-        order = db.get_order(callback.data.removeprefix("retry:"), admin_id=admin.telegram_id)
+        order = await db.get_order(callback.data.removeprefix("retry:"), admin_id=admin.telegram_id)
         if not order:
             await callback.answer("سفارش قابل‌دسترسی نیست.", show_alert=True)
             return
-        if "Ambiguous" in str(order.get("delivery_error", "")):
+        if order.get("delivery_status") == "ambiguous" or "Ambiguous" in str(order.get("delivery_error", "")):
             await best_effort_callback_answer(callback, "این ارسال نیازمند تأیید بررسی دستی است.", show_alert=True)
             if isinstance(callback.message, Message):
                 await callback.message.answer(
@@ -631,8 +659,11 @@ def create_router() -> Router:
                     reply_markup=reconcile_keyboard(order["public_id"]),
                 )
             return
+        if db.postgres:
+            await best_effort_callback_answer(callback, "این سفارش در صف ارسال است؛ ارسال توسط worker انجام می‌شود.", show_alert=True)
+            return
         sent = await publish_order(cast(Bot, callback.bot), db, config, order, admin)
-        current = db.get_order_by_id(order["id"])
+        current = await db.get_order_by_id(order["id"])
         if sent:
             status_message = "ارسال شد."
         elif current and current["delivery_status"] == "sending":
@@ -644,14 +675,17 @@ def create_router() -> Router:
             await callback.message.answer(f"سفارش {order['public_id']} ارسال شد.", reply_markup=main_keyboard())
 
     @router.callback_query(F.data.startswith("reconcile:"))
-    async def reconcile(callback: CallbackQuery, state: FSMContext, db: Database, config: Config) -> None:
+    async def reconcile(callback: CallbackQuery, state: FSMContext, db: AsyncPersistence, config: Config) -> None:
         admin = await authorized_admin(callback, state, db)
         if not admin or not isinstance(callback.message, Message) or not callback.data:
             return
         public_id = callback.data.removeprefix("reconcile:")
-        order = db.get_order(public_id, admin_id=admin.telegram_id)
-        if not order or "Ambiguous" not in str(order.get("delivery_error", "")):
+        order = await db.get_order(public_id, admin_id=admin.telegram_id)
+        if not order or not (order.get("delivery_status") == "ambiguous" or "Ambiguous" in str(order.get("delivery_error", ""))):
             await best_effort_callback_answer(callback, "سفارش برای بررسی دستی قابل‌دسترسی نیست.", show_alert=True)
+            return
+        if db.postgres:
+            await best_effort_callback_answer(callback, "این سفارش برای بررسی دستی در اختیار worker است.", show_alert=True)
             return
         await best_effort_callback_answer(callback, "تلاش دستی آغاز شد.", show_alert=True)
         sent = await publish_order(cast(Bot, callback.bot), db, config, order, admin, allow_ambiguous=True)
@@ -702,8 +736,14 @@ async def run() -> None:
     config = Config.from_env()
     logging.basicConfig(level=config.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     db = Database(config.database_path, config.duplicate_window_days)
-    db.initialize()
-    recovered = db.recover_interrupted_deliveries()
+    db: AsyncPersistence
+    if config.database_url:
+        from backend.db import SessionFactory
+        db = PostgresPersistence(SessionFactory, config.duplicate_window_days)
+    else:
+        db = SQLitePersistence(Database(config.database_path, config.duplicate_window_days))
+    await db.initialize()
+    recovered = await db.recover_interrupted_deliveries()
     if recovered:
         LOGGER.warning("Marked %d interrupted deliveries for manual retry", recovered)
     bot = Bot(config.bot_token)
@@ -725,5 +765,6 @@ def main() -> None:
 
 def create_dispatcher() -> Dispatcher:
     dispatcher = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
+    dispatcher.update.outer_middleware(PersistenceMiddleware())
     dispatcher.include_router(create_router())
     return dispatcher
