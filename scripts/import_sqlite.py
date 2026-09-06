@@ -114,12 +114,12 @@ def differs(found: Any, expected: dict[str, Any], fields: tuple[str, ...]) -> bo
     return any(found[field] != expected[field] for field in fields)
 
 async def reset_sequences(connection: Any) -> None:
-    for table in ("users", "orders"):
+    for table in ("users", "orders", "outbox"):
         sequence = (await connection.execute(text("SELECT pg_get_serial_sequence(:table, 'id')"), {"table": table})).scalar_one()
         if sequence:
             await connection.execute(text(f"SELECT setval(:sequence, COALESCE((SELECT max(id) FROM {table}), 1), true)"), {"sequence": sequence})
 
-async def run(source: str, destination: str, dry_run: bool, reset_seq: bool = True) -> int:
+async def run(source: str, destination: str, dry_run: bool) -> int:
     admins, orders, source_hash = read_source(source)
     validate_source(admins, orders)
     engine = create_async_engine(destination)
@@ -179,7 +179,7 @@ async def run(source: str, destination: str, dry_run: bool, reset_seq: bool = Tr
                 imported += 1
             for order_id, duplicate_of in deferred_duplicates:
                 await connection.execute(text("UPDATE orders SET duplicate_of=:duplicate_of WHERE id=:id"), {"id": order_id, "duplicate_of": duplicate_of})
-            if reset_seq and not dry_run:
+            if not dry_run:
                 await reset_sequences(connection)
             if dry_run:
                 await transaction.rollback()

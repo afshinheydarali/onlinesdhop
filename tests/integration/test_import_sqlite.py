@@ -1,34 +1,34 @@
 """Real PostgreSQL acceptance tests for the legacy SQLite importer."""
 from __future__ import annotations
 
-import asyncio
 import hashlib
-import os
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from scripts.import_sqlite import run
-from backend.models import Base
 
-DB_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://onlineshop_test:onlineshop-local-pg18-20260904@127.0.0.1:15432/onlineshop_import_test")
+DB_URL = __import__("os").getenv("TEST_DATABASE_URL")
 
 SCHEMA = """CREATE TABLE admins(telegram_id INTEGER PRIMARY KEY,name TEXT NOT NULL,admin_code TEXT NOT NULL,is_active INTEGER NOT NULL,created_at TEXT NOT NULL);
 CREATE TABLE orders(id INTEGER PRIMARY KEY,public_id TEXT NOT NULL,admin_telegram_id INTEGER NOT NULL,customer_name TEXT NOT NULL,phone_raw TEXT NOT NULL,phone_normalized TEXT NOT NULL,province TEXT NOT NULL,city TEXT NOT NULL,address TEXT NOT NULL,postal_code TEXT,product_raw TEXT NOT NULL,product_normalized TEXT NOT NULL,quantity INTEGER NOT NULL,amount INTEGER,notes TEXT,photo_file_id TEXT NOT NULL,duplicate_of INTEGER,draft_token TEXT NOT NULL,created_at TEXT NOT NULL,delivery_status TEXT NOT NULL,delivery_attempts INTEGER NOT NULL,delivery_error TEXT,channel_photo_message_id INTEGER,channel_text_message_id INTEGER,delivered_at TEXT);"""
 
 class ImporterIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        if not DB_URL.rsplit("/", 1)[-1].endswith("_test"):
+        if not DB_URL:
+            raise RuntimeError("TEST_DATABASE_URL is required")
+        parsed = make_url(DB_URL)
+        if parsed.host not in {"127.0.0.1", "localhost", "::1"} or not (parsed.database or "").endswith("_test"):
             raise RuntimeError("refusing to reset a non-test database")
         self.engine = create_async_engine(DB_URL)
         async with self.engine.begin() as c:
-            await c.execute(text("DROP TABLE IF EXISTS outbox, idempotency_keys, orders, admins, users CASCADE"))
-        async with self.engine.begin() as c:
-            await c.run_sync(Base.metadata.create_all)
+            await c.execute(text("TRUNCATE outbox, idempotency_keys, orders, admins, users RESTART IDENTITY CASCADE"))
         self.temp = tempfile.TemporaryDirectory(prefix="import # ")
         self.source = str(Path(self.temp.name) / "legacy # snapshot.sqlite")
         c = sqlite3.connect(self.source)
@@ -75,7 +75,7 @@ class ImporterIntegrationTests(unittest.IsolatedAsyncioTestCase):
         c = sqlite3.connect(self.source)
         c.execute("UPDATE orders SET id=50, public_id='P20' WHERE id=40")
         c.commit(); c.close()
-        with self.assertRaises(Exception):
+        with self.assertRaises(IntegrityError):
             await run(self.source, DB_URL, True)
         self.assertEqual(await self.counts(), {"users": 1, "admins": 1, "orders": 3, "outbox": 2})
 
