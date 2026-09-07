@@ -47,6 +47,7 @@ class FulfillmentHTTPTests(unittest.IsolatedAsyncioTestCase):
             session.add_all(users)
             await session.commit()
             self.ids = {user.role: user.id for user in users}
+        self.order_counter = 0
         from backend.api.app import app
 
         self.patches = [patch("backend.api.app.SessionFactory", self.sf), patch("backend.auth.SessionFactory", self.sf)]
@@ -68,7 +69,8 @@ class FulfillmentHTTPTests(unittest.IsolatedAsyncioTestCase):
         from backend.services.orders import Actor, CreateOrderCommand, OrderService
         from order_bot.validation import normalize_phone, normalize_product
 
-        phone = "09121234567"
+        self.order_counter += 1
+        phone = f"0912123{4567 + self.order_counter:04d}"
         product = "http widget"
         async with self.sf() as session:
             result = await OrderService(session).create_order(
@@ -86,7 +88,7 @@ class FulfillmentHTTPTests(unittest.IsolatedAsyncioTestCase):
                     100,
                     None,
                     "",
-                    "http-order",
+                    f"http-order-{role}-{self.order_counter}",
                 ),
                 Actor(self.ids[role], role),
             )

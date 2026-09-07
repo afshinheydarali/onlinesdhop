@@ -230,6 +230,7 @@ class PaymentReconciliation(Base):
     __table_args__ = (
         UniqueConstraint("order_id", "kind", name="uq_payment_reconciliation_order_kind"),
         CheckConstraint("status IN ('open','resolved')", name="ck_payment_reconciliation_status"),
+        Index("ix_payment_reconciliations_order", "order_id", "created_at", "id"),
     )
 
 
