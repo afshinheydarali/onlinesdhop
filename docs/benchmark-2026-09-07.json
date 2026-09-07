@@ -1,0 +1,21 @@
+{
+  "measured_at": "2026-09-07T14:05:46.084407+00:00",
+  "machine": "Windows-10-10.0.26200-SP0",
+  "python": "3.11.0",
+  "dataset": "seed_synthetic: 2 users, 2 admins, 3 products; no customer records before run",
+  "request_mix": {
+    "GET /api/v1/products": "70%",
+    "POST /api/v1/orders": "30%"
+  },
+  "requested_requests": 100,
+  "completed_requests": 100,
+  "concurrency": 4,
+  "duration_seconds": 0.411,
+  "p50_ms": 10.007,
+  "p95_ms": 57.094,
+  "throughput_rps": 243.106,
+  "errors": 0,
+  "error_rate": 0.0,
+  "status_counts": {"200": 100},
+  "query_count": "not instrumented by this HTTP benchmark; use SQLAlchemy event hooks for query-level profiling"
+}

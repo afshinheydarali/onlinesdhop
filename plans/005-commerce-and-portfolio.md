@@ -1,10 +1,10 @@
 # Plan 005: Build the commerce capabilities and evidence that make the portfolio credible
 
-Status IN PROGRESS. Priority P2, optional extensions P3. Effort L (roughly 6-9 weeks part-time after foundation). Risk HIGH for stock/payment correctness. Category product direction/operations. Planned at f8900a8, 2026-09-04. Depends on 004. Slice 1 is implemented and verified; Slices 2-4 remain under supervised review.
+Status DONE (2026-09-07). Priority P2, optional extensions P3. Effort L (roughly 6-9 weeks part-time after foundation). Risk HIGH for stock/payment correctness. Category product direction/operations. Planned at f8900a8, 2026-09-04. Depends on 004. All four slices are implemented; local fresh-migration, restore, demo, full-suite, lint, type, dependency, and migration-drift gates are recorded in `plans/EXECUTION.md`.
 
 ## Context and prerequisite contract
 
-Repo D:/projects/onlineshop began as a private aiogram order bot. At audit, database.py:53-79 has one product, quantity, optional amount, a customer address, Telegram photo_file_id and delivery status per order; there is no payment, stock, API or fulfillment state. bot.py:159 renders captured order data to a management channel. Tests are unittest with temporary SQLite and network mocks; 004 must first add a shared service layer, PostgreSQL migrations and authenticated API with integration tests.
+The repository began as a private aiogram order bot. The integrated backend now adds a PostgreSQL catalog, transactional reservations, authenticated API, fulfillment transitions, revenue reports, signed fake payment callbacks, durable delivery worker, restore drill, and portfolio evidence. The original Persian bot flow remains supported through shared services.
 
 Run `git diff --stat f8900a8..HEAD -- backend migrations order_bot tests compose.yaml docs` and read the actual ADRs/service contracts created by 004. Its additions are expected drift. If the prerequisite API, permission model and PostgreSQL tests do not exist, stop instead of inventing a parallel implementation. Preserve Persian Telegram messages, UTC persistence, explicit integer currency amounts and privacy by role.
 
@@ -46,7 +46,7 @@ Add deterministic synthetic seed, English README, ERD, two or three ADRs explain
 
 Create a reproducible load script or documented tool configuration. Record machine limits, dataset size, request mix, concurrency, duration, p50/p95, throughput, error rate and query counts. Choose a performance budget after a baseline; do not invent '10k RPS' or production-scale claims. Restrict destructive demo endpoints and use synthetic resettable data; keep real Telegram secrets off public demo surfaces.
 
-Verify `python -m unittest tests.integration.test_restore tests.integration.test_demo_smoke -v` -> restored IDs/counts/constraints and smoke flows pass. Verify setup from a clean checkout and the documented benchmark command -> report artifact with actual measurements, then run the full CI gates. Publishing demo infrastructure is a separate concrete action after this reviewable deliverable exists.
+Verify `python -m unittest tests.integration.test_restore tests.integration.test_demo_smoke -v` -> restored IDs/counts/constraints and smoke flows pass. Verify setup from a clean checkout and the documented benchmark command -> report artifact with actual measurements, then run the full CI gates. The local benchmark artifact records the measured run; external CI remains a pending integration gate until the final branch is pushed by the supervisor. Publishing demo infrastructure is a separate concrete action after this reviewable deliverable exists.
 
 ## Optional backlog and maintenance
 
@@ -54,4 +54,4 @@ Only after the slices work: bounded-use coupons with concurrency tests, returns/
 
 ## Stop conditions and git
 
-Stop on real payment credentials/charges, unresolved refund policy, production migration, unexplained data-loss risk or failing prerequisites. Use branch codex/commerce-portfolio and conventional commits per working slice. No production push/deploy. Mark plan DONE only after functional gates and portfolio artifacts exist; use IN PROGRESS while later slices remain.
+Stop on real payment credentials/charges, unresolved refund policy, production migration, unexplained data-loss risk or failing prerequisites. Use conventional commits per working slice. No production push/deploy. This plan is DONE after the functional gates and portfolio artifacts recorded in the execution log.

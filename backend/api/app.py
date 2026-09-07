@@ -1,3 +1,8 @@
+import json
+import logging
+import re
+import time
+import uuid
 from datetime import UTC, datetime
 from typing import Annotated, Any, cast
 
@@ -7,7 +12,7 @@ from fastapi.routing import APIRoute
 from fastapi.security import OAuth2PasswordRequestForm
 from pwdlib.exceptions import UnknownHashError
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from backend.auth import (
@@ -18,8 +23,8 @@ from backend.auth import (
     require,
     verify_password_async,
 )
-from backend.db import SessionFactory
-from backend.models import Admin, InventoryBalance, Order, Product, User
+from backend.db import SessionFactory, pool_metrics
+from backend.models import Admin, InventoryBalance, Order, Outbox, Product, User
 from backend.services.fulfillment import (
     FulfillmentService,
     InvalidFulfillmentTransition,
@@ -41,6 +46,9 @@ from backend.services.payments import (
 )
 
 app = FastAPI(title="OnlineShop API", version="1.0.0")
+logger = logging.getLogger("onlineshop.http")
+_request_metrics: dict[str, int | float] = {"requests": 0, "errors": 0, "latency_ms_total": 0.0}
+_request_id_pattern = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 ROUTE_PERMISSIONS = {
     "POST /api/v1/auth/token": "public",
     "POST /api/v1/orders": "owner|manager|seller",
@@ -61,6 +69,7 @@ ROUTE_PERMISSIONS = {
     "PATCH /api/v1/users/{user_id}/revoke": "owner",
     "GET /health/live": "public",
     "GET /health/ready": "public",
+    "GET /metrics": "owner|manager",
 }
 
 
@@ -158,6 +167,50 @@ class Token(Strict):
 class OrderPage(Strict):
     items: list[OrderOut]
     next_cursor: int | None = None
+
+
+def _request_id(request: Request) -> str:
+    supplied = request.headers.get("X-Request-ID", "")
+    return supplied if _request_id_pattern.fullmatch(supplied) else uuid.uuid4().hex
+
+
+@app.middleware("http")
+async def request_observability(request: Request, call_next: Any) -> Any:
+    """Emit one metadata-only JSON event per request and propagate correlation."""
+    correlation_id = _request_id(request)
+    request.state.correlation_id = correlation_id
+    started = time.perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        latency_ms = round((time.perf_counter() - started) * 1000, 3)
+        _request_metrics["requests"] += 1
+        _request_metrics["latency_ms_total"] += latency_ms
+        if status_code >= 500:
+            _request_metrics["errors"] += 1
+        # Only route/method/status/timing and safe identifiers are retained.
+        event: dict[str, Any] = {
+            "event": "http_request",
+            "request_id": correlation_id,
+            "method": request.method,
+            "path": request.url.path,
+            "status_code": status_code,
+            "latency_ms": latency_ms,
+        }
+        order_id = getattr(request.state, "order_id", None)
+        if isinstance(order_id, str) and order_id:
+            event["order_id"] = order_id
+        logger.info(json.dumps(event, separators=(",", ":"), sort_keys=True))
+        if "response" in locals():
+            response.headers["X-Request-ID"] = correlation_id
+
+
+def _mark_order(request: Request, order: Order | None) -> None:
+    if order is not None:
+        request.state.order_id = order.public_id
 
 
 @app.post("/api/v1/payments/fake/callback")
@@ -279,6 +332,7 @@ async def token(request: Request, form: Annotated[OAuth2PasswordRequestForm, Dep
 @app.post("/api/v1/orders", response_model=OrderOut, response_model_exclude_none=True)
 async def create_order(
     payload: OrderIn,
+    request: Request,
     actor: Actor = Depends(require("owner", "manager", "seller")),  # noqa: B008
 ) -> OrderOut:
     from order_bot.validation import normalize_phone, normalize_product
@@ -308,12 +362,14 @@ async def create_order(
             raise HTTPException(409, "duplicate confirmation required")
         if result.order is None:
             raise HTTPException(500, "order creation returned no order")
+        _mark_order(request, result.order)
         return output(result.order, actor)
 
 
 @app.post("/api/v1/commerce/orders", response_model=OrderOut, response_model_exclude_none=True)
 async def create_cart_order(
     payload: CartOrderIn,
+    request: Request,
     actor: Actor = Depends(require("owner", "manager", "seller")),  # noqa: B008
 ) -> OrderOut:
     async with SessionFactory() as s:
@@ -333,6 +389,7 @@ async def create_cart_order(
         )
         if result.order is None:
             raise HTTPException(500, "order creation returned no order")
+        _mark_order(request, result.order)
         return output(result.order, actor)
 
 
@@ -387,12 +444,14 @@ async def list_products(
 )
 async def get_order(
     public_id: str,
+    request: Request,
     actor: Actor = Depends(require("owner", "manager", "seller", "warehouse")),  # noqa: B008
 ) -> OrderOut:
     async with SessionFactory() as s:
         order = await OrderService(s).get_order(public_id, actor)
         if order is None:
             raise HTTPException(404, "order not found")
+        _mark_order(request, order)
         return output(order, actor)
 
 
@@ -582,13 +641,55 @@ async def live() -> dict[str, str]:
 
 
 @app.get("/health/ready")
-async def ready() -> dict[str, str]:
+async def ready() -> dict[str, Any]:
     try:
         async with SessionFactory() as s:
             await s.execute(select(1))
     except (OSError, SQLAlchemyError):
         raise HTTPException(503, "database unavailable")
-    return {"status": "ok"}
+    return {"status": "ok", "database": "ok", "pool": pool_metrics()}
+
+
+@app.get("/metrics")
+async def metrics(actor: Actor = Depends(require("owner", "manager"))) -> dict[str, Any]:  # noqa: B008
+    """Return bounded operational counters; values contain no customer data."""
+    requests = int(_request_metrics["requests"])
+    errors = int(_request_metrics["errors"])
+    backlog: dict[str, Any] = {"pending": 0, "oldest_age_seconds": None, "retry_count": 0}
+    database: dict[str, Any] = {"available": False, "pool": pool_metrics()}
+    try:
+        async with SessionFactory() as s:
+            now = datetime.now(UTC)
+            pending, oldest, retries = (
+                await s.execute(
+                    select(
+                        func.count(Outbox.id),
+                        func.min(Order.created_at),
+                        func.coalesce(func.sum(Outbox.attempts), 0),
+                    )
+                    .select_from(Outbox)
+                    .join(Order, Order.id == Outbox.order_id)
+                    .where(Outbox.status.in_(("pending", "sending")))
+                )
+            ).one()
+            backlog = {
+                "pending": int(pending or 0),
+                "oldest_age_seconds": (max(0.0, (now - oldest).total_seconds()) if oldest else None),
+                "retry_count": int(retries or 0),
+            }
+            database["available"] = True
+    except (OSError, SQLAlchemyError):
+        pass
+    return {
+        "http": {
+            "request_count": requests,
+            "error_count": errors,
+            "error_rate": (errors / requests if requests else 0.0),
+            "latency_ms_avg": (_request_metrics["latency_ms_total"] / requests if requests else 0.0),
+        },
+        "delivery": backlog,
+        "database": database,
+    }
 
 
 # Keep this manifest synchronized with the actual protected/public HTTP surface.
@@ -599,7 +700,7 @@ def _route_key(route: APIRoute, method: str) -> str:
 _actual_route_keys = {
     _route_key(route, method)
     for route in app.routes
-    if isinstance(route, APIRoute) and (route.path.startswith("/api/v1/") or route.path.startswith("/health/"))
+    if isinstance(route, APIRoute) and (route.path.startswith("/api/v1/") or route.path.startswith("/health/") or route.path == "/metrics")
     for method in getattr(route, "methods", set())
     if method not in {"HEAD", "OPTIONS"}
 }

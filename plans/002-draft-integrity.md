@@ -1,12 +1,12 @@
 # Plan 002: Bind every order action to the preview the user actually saw
 
-Status IN PROGRESS. Priority P1. Effort M. Risk MED. Category correctness/concurrency. Planned at f8900a8, 2026-09-04. Depends on 001.
+Status DONE. Priority P1. Effort M. Risk MED. Category correctness/concurrency. Planned at f8900a8, 2026-09-04. Depends on 001. Commits `26ec2a6` and `066f16d` bind actions to draft/revision/snapshot and isolate same-user updates; the recorded 44-test gate, Ruff, mypy, pip check, and CI run `33958733669` passed.
 
 Drift reconciled by supervisor against bd95678 on 2026-09-05: Plan001 added typing narrowings, admin-list splitting, Unicode phone normalization and real handler tests. Callback identity/state and unguarded post-publication clear remain unchanged in behavior. The excerpts below describe the original audit; use `git diff bd95678..HEAD -- order_bot/bot.py tests` for execution drift. No unexplained source changes remain.
 
 ## Context and drift check
 
-Repository D:/projects/onlineshop is a single-instance aiogram/SQLite internal order bot. Run `git diff --stat f8900a8..HEAD -- order_bot/bot.py tests` and inspect working changes. Expected prerequisite changes are tests/tooling and bounded /admins fixes. Stop on unexplained confirmation/FSM changes.
+The repository is a single-instance aiogram/SQLite internal order bot. Run `git diff --stat f8900a8..HEAD -- order_bot/bot.py tests` and inspect working changes. Expected prerequisite changes are tests/tooling and bounded /admins fixes. Stop on unexplained confirmation/FSM changes.
 
 Current excerpts from order_bot/bot.py:
 

@@ -6,7 +6,7 @@ Execution scheduling clarification (supervisor, 2026-09-04): 001-003 are integra
 
 ## Current context and drift
 
-Repo D:/projects/onlineshop is an internal aiogram order-entry bot, not a public shop API. database.py contains admins and a single-product orders table. bot.py combines validation orchestration, workflow, presentation and delivery. Baseline tests use unittest with temporary SQLite and mocked network. The original product deliberately limits sellers' access to historic customer data.
+The repository is an internal aiogram order-entry bot, not a public shop API. database.py contains admins and a single-product orders table. bot.py combines validation orchestration, workflow, presentation and delivery. Baseline tests use unittest with temporary SQLite and mocked network. The original product deliberately limits sellers' access to historic customer data.
 
 Run `git diff --stat f8900a8..HEAD -- order_bot tests requirements.txt Dockerfile compose.yaml docs` and read prerequisite changes. Expected source anchors:
 

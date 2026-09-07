@@ -11,7 +11,8 @@ fingerprint, and provider transaction uniqueness before mutating payment
 state. A late callback is recorded as `reconciliation` and cannot revive an
 expired or cancelled order.
 
-Delivery jobs are durable rows in PostgreSQL. A worker claims with
+Delivery jobs are durable rows in PostgreSQL. The repository includes the
+worker process and its lease/retry state machine. A worker claims with
 `FOR UPDATE SKIP LOCKED`, a random claim token and a lease. A timeout after a
 Telegram request becomes `ambiguous` and needs explicit reconciliation before
 retry. After a photo succeeds its message ID is committed before text is
@@ -23,5 +24,7 @@ python -m backend.delivery_worker --transport my_transport:make_transport
 ```
 
 `make_transport` must return an object implementing async `send_photo(order)`
-and `send_text(order, photo_message_id)`. Use a separate fake transport in
-tests; no real payment calls are made by this project.
+and `send_text(order, photo_message_id)`. The transport is intentionally
+injected, so the demo and tests use a deterministic fake transport and never
+send to a real Telegram channel. Payment calls are likewise confined to the
+documented fake callback.
