@@ -4,12 +4,20 @@ OnlineShop is a Python 3.11+ backend for a small Telegram and HTTP order workflo
 
 ## Quick start
 
-The API uses PostgreSQL and Alembic. For a local disposable environment, use the portable PostgreSQL tools in `D:\projects\onlineshop-worktrees\postgres-runtime\pgsql\bin` or Docker Compose.
+The API uses PostgreSQL and Alembic. Docker Compose is the portable quick start; a local PostgreSQL installation also works when its client tools are on `PATH`.
 
 ```powershell
-$env:DATABASE_URL = "postgresql+asyncpg://onlineshop_test:onlineshop-local-pg18-20260904@localhost:15432/onlineshop_portfolio_test"
+Copy-Item .env.example .env
+# Set POSTGRES_PASSWORD and JWT_SECRET in .env or in your shell; do not commit .env.
+docker compose up --build
+```
+
+For disposable integration data, point the test URL at a local database ending in `_test`:
+
+```powershell
+$env:DATABASE_URL = "postgresql+asyncpg://<user>:<password>@localhost:<port>/<database>"
 $env:TEST_DATABASE_URL = $env:DATABASE_URL
-$env:JWT_SECRET = "local-only-change-this-secret"
+$env:JWT_SECRET = "<local-secret>"
 python -m pip install -r requirements.txt -r requirements-dev.txt -c requirements-lock.txt
 python -m alembic upgrade head
 python -m scripts.seed_synthetic --reset
@@ -17,14 +25,6 @@ python -m uvicorn backend.api.app:app --host 127.0.0.1 --port 8000
 ```
 
 The seed command is restricted to `localhost` and the named `*_test` databases. It creates two users, two admins, and three products. Never place real customer records or Telegram credentials in this dataset.
-
-Compose starts PostgreSQL, migrations, and the API after the database is healthy:
-
-```powershell
-$env:POSTGRES_PASSWORD = "local-password"
-$env:DATABASE_URL = "postgresql+asyncpg://onlineshop:local-password@postgres:5432/onlineshop"
-docker compose up --build
-```
 
 ## Architecture
 
@@ -81,7 +81,7 @@ Warehouse and manager users can inspect and transition fulfillment through `GET/
 
 Orders, item snapshots, reservations, idempotency records, stock movements, and outbox insertion commit or roll back together. Duplicate idempotency keys replay the original order only when their canonical payload matches; a different payload conflicts. Inventory reservations lock all products in deterministic order and enforce non negative database constraints. Seller responses omit customer PII and manager/warehouse access follows the route permission matrix in [`docs/api/permissions.md`](docs/api/permissions.md). Currency is explicit integer IRR in the current catalog flow.
 
-Backups contain personal data and must be access controlled. The backup and restore scripts only accept local `onlineshop_portfolio_test` or `onlineshop_restore_test` targets; restore always targets the latter. See [`docs/backup-restore.md`](docs/backup-restore.md).
+Backups contain personal data and must be access controlled. The backup and restore scripts accept only local databases ending in `_test`; restore additionally requires a target ending in `_restore_test`. PostgreSQL tools resolve from optional `PG_BIN` and then `PATH`. See [`docs/backup-restore.md`](docs/backup-restore.md).
 
 ## Demo and evidence
 
@@ -108,7 +108,7 @@ mypy order_bot backend
 python -m pip check
 ```
 
-The PostgreSQL integration tests refuse non local databases and names outside `onlineshop_portfolio_test` and `onlineshop_restore_test`. Without `TEST_DATABASE_URL`, they skip rather than connect to a default database.
+The PostgreSQL integration tests refuse non local databases and names that do not end in `_test`; restore uses `RESTORE_DATABASE_URL` when supplied or derives a separate `_restore_test` target. Without `TEST_DATABASE_URL`, they skip rather than connect to a default database.
 
 ## Decisions and limitations
 

@@ -16,12 +16,13 @@ class DemoSmokeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         raw = os.getenv("TEST_DATABASE_URL")
         if not raw:
-            self.skipTest("TEST_DATABASE_URL must target the dedicated local portfolio test DB")
+            self.skipTest("TEST_DATABASE_URL must target a local *_test database")
         from sqlalchemy.engine import make_url
 
         url = make_url(raw)
-        if url.host not in {"localhost", "127.0.0.1", "::1"} or url.database != "onlineshop_portfolio_test":
-            raise RuntimeError("test_demo_smoke requires local onlineshop_portfolio_test only")
+        if (url.host not in {"localhost", "127.0.0.1", "::1"} or not url.database
+                or not url.database.endswith("_test") or url.database.endswith("_restore_test")):
+            raise RuntimeError("test_demo_smoke requires a local database ending in _test")
         seed_env = os.environ.copy()
         subprocess.run([sys.executable, "-m", "scripts.seed_synthetic", "--reset"], check=True, env=seed_env)
         self.engine = create_async_engine(raw, poolclass=NullPool)

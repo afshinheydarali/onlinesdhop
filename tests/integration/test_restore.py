@@ -19,13 +19,18 @@ class RestoreIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_restore_preserves_ids_counts_and_constraints(self) -> None:
         raw = os.getenv("TEST_DATABASE_URL")
         if not raw:
-            self.skipTest("TEST_DATABASE_URL must target the dedicated local portfolio test DB")
+            self.skipTest("TEST_DATABASE_URL must target a local *_test database")
         source = make_url(raw)
-        if source.host not in {"localhost", "127.0.0.1", "::1"} or source.database != "onlineshop_portfolio_test":
-            raise RuntimeError("test_restore requires local onlineshop_portfolio_test only")
-        target = source.set(database="onlineshop_restore_test")
+        if (source.host not in {"localhost", "127.0.0.1", "::1"} or not source.database
+                or not source.database.endswith("_test") or source.database.endswith("_restore_test")):
+            raise RuntimeError("test_restore requires a local source database ending in _test")
+        restore_raw = os.getenv("RESTORE_DATABASE_URL")
+        target = make_url(restore_raw) if restore_raw else source.set(database=f"{source.database[:-5]}_restore_test")
+        if target.host not in {"localhost", "127.0.0.1", "::1"} or not target.database or not target.database.endswith("_restore_test"):
+            raise RuntimeError("restore target must be local and end in _restore_test")
         env = os.environ.copy()
         env["TEST_DATABASE_URL"] = source.render_as_string(hide_password=False)
+        env["RESTORE_DATABASE_URL"] = target.render_as_string(hide_password=False)
         root = Path(__file__).parents[2]
         python = os.environ.get("PORTFOLIO_PYTHON", sys.executable)
         subprocess.run([python, "-m", "scripts.reset_synthetic"], cwd=root, env=env, check=True)
@@ -41,15 +46,12 @@ class RestoreIntegrationTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             backup = Path(tmp) / "portfolio.dump"
             subprocess.run(
-                ["powershell", "-NoProfile", "-File", str(root / "scripts" / "backup.ps1"),
-                 "-DatabaseUrl", env["TEST_DATABASE_URL"], "-OutputPath", str(backup)],
+                [python, "-m", "scripts.pg_tools", "backup", "--output", str(backup)],
                 cwd=root, env=env, check=True
             )
             target_env = env.copy()
-            target_env["TEST_DATABASE_URL"] = target.render_as_string(hide_password=False)
             subprocess.run(
-                ["powershell", "-NoProfile", "-File", str(root / "scripts" / "restore.ps1"),
-                 "-DatabaseUrl", target_env["TEST_DATABASE_URL"], "-BackupPath", str(backup)],
+                [python, "-m", "scripts.pg_tools", "restore", "--backup", str(backup)],
                 cwd=root, env=target_env, check=True
             )
         target_engine = create_async_engine(target.render_as_string(hide_password=False), poolclass=NullPool)
