@@ -214,6 +214,25 @@ class PaymentAttempt(Base):
     )
 
 
+class PaymentReconciliation(Base):
+    """Durable manual follow-up for money that cannot be settled automatically."""
+
+    __tablename__ = "payment_reconciliations"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    order_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("orders.id", ondelete="CASCADE"))
+    payment_attempt_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("payment_attempts.id", ondelete="SET NULL"), nullable=True)
+    kind: Mapped[str] = mapped_column(String(40))
+    reason: Mapped[str] = mapped_column(Text)
+    amount: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    currency: Mapped[str | None] = mapped_column(String(3), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="open", server_default="open")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (
+        UniqueConstraint("order_id", "kind", name="uq_payment_reconciliation_order_kind"),
+        CheckConstraint("status IN ('open','resolved')", name="ck_payment_reconciliation_status"),
+    )
+
+
 class StockMovement(Base):
     __tablename__ = "stock_movements"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)

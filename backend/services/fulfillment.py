@@ -14,6 +14,7 @@ from backend.models import (
     InventoryBalance,
     Order,
     PaymentAttempt,
+    PaymentReconciliation,
     Reservation,
     StockMovement,
     User,
@@ -70,6 +71,39 @@ class FulfillmentService:
         return list(
             (await self.session.scalars(select(Reservation).where(Reservation.order_id == order_id).order_by(Reservation.product_id).with_for_update())).all()
         )
+
+    async def _record_reconciliation(
+        self,
+        order: Order,
+        *,
+        kind: str,
+        reason: str,
+        at: datetime,
+        amount: int | None = None,
+        currency: str | None = None,
+        payment_attempt_id: int | None = None,
+    ) -> PaymentReconciliation:
+        """Insert one durable manual-work item while the order lock is held."""
+        row = await self.session.scalar(
+            select(PaymentReconciliation)
+            .where(PaymentReconciliation.order_id == order.id, PaymentReconciliation.kind == kind)
+            .with_for_update()
+        )
+        if row is not None:
+            return row
+        row = PaymentReconciliation(
+            order_id=order.id,
+            payment_attempt_id=payment_attempt_id,
+            kind=kind,
+            reason=reason,
+            amount=amount,
+            currency=currency,
+            status="open",
+            created_at=at,
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return row
 
     async def _release_locked(self, order: Order, *, status: str, at: datetime) -> None:
         reservations = await self._reservations(order.id)
@@ -142,8 +176,16 @@ class FulfillmentService:
                 transitioned_at=moment,
             )
         )
-        if target == "cancelled" and order.payment_status == "paid":
+        if target in {"cancelled", "expired"} and order.payment_status == "paid":
             order.reconciliation_required = True
+            await self._record_reconciliation(
+                order,
+                kind="refund_required",
+                reason=f"paid order {target}; refund requires verified settlement",
+                at=moment,
+                amount=order.amount,
+                currency=order.currency or "IRR",
+            )
         await self.session.commit()
         return TransitionResult(order, True)
 
@@ -214,6 +256,14 @@ class FulfillmentService:
         )
         if order.payment_status == "paid":
             order.reconciliation_required = True
+            await self._record_reconciliation(
+                order,
+                kind="refund_required",
+                reason="paid order expired; refund requires verified settlement",
+                at=moment,
+                amount=order.amount,
+                currency=order.currency or "IRR",
+            )
         await self.session.commit()
         return TransitionResult(order, True)
 
@@ -278,6 +328,16 @@ class FulfillmentService:
                 payload_fingerprint=payload_fingerprint,
             )
             self.session.add(attempt)
+            await self.session.flush()
+            await self._record_reconciliation(
+                order,
+                kind="late_payment",
+                reason=f"payment arrived after order {order.fulfillment_status}",
+                at=moment,
+                amount=amount,
+                currency=currency,
+                payment_attempt_id=attempt.id,
+            )
             await self.session.commit()
             return attempt
         if order.amount is not None and (amount != order.amount or currency != (order.currency or "IRR")):
