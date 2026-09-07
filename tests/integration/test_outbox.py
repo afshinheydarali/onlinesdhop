@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import unittest
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select, text
 from sqlalchemy.engine import make_url
@@ -130,6 +130,57 @@ class OutboxPostgresTests(unittest.IsolatedAsyncioTestCase):
         retry_at = DeliveryService._backoff(1, 10**9)
         self.assertGreaterEqual((retry_at - before).total_seconds(), 3600)
         self.assertLess((retry_at - before).total_seconds(), 3602)
+
+    async def test_expired_claim_fences_every_finalizer_and_live_claim_succeeds(self) -> None:
+        from backend.models import Order, Outbox
+        from backend.services.delivery import DeliveryService
+        from backend.services.orders import OrderService
+
+        async def reset() -> None:
+            async with self.sf() as session:
+                row = await session.scalar(select(Outbox))
+                order = await session.scalar(select(Order))
+                row.status, row.worker_id, row.claim_token = "pending", None, None
+                row.lease_expires_at, row.attempts = None, 0
+                row.next_attempt_at, row.error_code = datetime.now(UTC), None
+                order.delivery_status, order.delivery_error = "pending", None
+                order.channel_photo_message_id, order.channel_text_message_id = None, None
+                await session.commit()
+
+        operations = [
+            lambda service, claim: service.mark_photo_sent(claim.order_id, claim.claim_token, 701),
+            lambda service, claim: service.mark_delivery_sent(claim.order_id, claim.claim_token, 701, 702),
+            lambda service, claim: service.mark_delivery_failed(claim.order_id, claim.claim_token, "late-finalize"),
+            lambda service, claim: service.mark_delivery_ambiguous(claim.order_id, claim.claim_token, "late-finalize"),
+        ]
+        for operation in operations:
+            await reset()
+            async with self.sf() as session:
+                claim = await DeliveryService(session).claim_next(worker_id="stale", lease_seconds=300)
+            self.assertIsNotNone(claim)
+            async with self.sf() as session:
+                row = await session.scalar(select(Outbox))
+                row.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+                await session.commit()
+            async with self.sf() as session:
+                with self.assertRaises(ValueError):
+                    await operation(OrderService(session), claim)
+            async with self.sf() as session:
+                row = await session.scalar(select(Outbox))
+                order = await session.scalar(select(Order))
+                self.assertEqual((row.status, row.error_code, order.delivery_status), ("ambiguous", "lease_expired_manual_reconciliation", "ambiguous"))
+
+        await reset()
+        async with self.sf() as session:
+            claim = await DeliveryService(session).claim_next(worker_id="live", lease_seconds=300)
+            self.assertIsNotNone(claim)
+            service = OrderService(session)
+            await service.mark_photo_sent(claim.order_id, claim.claim_token, 703)
+            await service.mark_delivery_sent(claim.order_id, claim.claim_token, 703, 704)
+        async with self.sf() as session:
+            row = await session.scalar(select(Outbox))
+            order = await session.scalar(select(Order))
+            self.assertEqual((row.status, order.delivery_status, order.channel_text_message_id), ("sent", "sent", 704))
 
     async def test_photo_is_persisted_before_retrying_text(self) -> None:
         from backend.models import Order, Outbox

@@ -6,7 +6,7 @@ import uuid
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -423,10 +423,13 @@ class OrderService:
         await self.session.commit()
         return row
 
-    async def mark_photo_sent(
-        self, order_id: int, claim_token: str, photo_message_id: int
-    ) -> None:
-        """Fence and persist the first Telegram operation before sending text."""
+    async def _locked_live_claim(self, order_id: int, claim_token: str) -> Outbox:
+        """Lock and validate a claim before finalizing a provider operation.
+
+        If the token's lease expired, persist an ambiguous state before
+        rejecting the stale worker. This closes the gap between a transport
+        timeout and the recovery worker's next claim.
+        """
         row = await self.session.scalar(
             select(Outbox)
             .where(Outbox.order_id == order_id, Outbox.claim_token == claim_token)
@@ -434,6 +437,26 @@ class OrderService:
         )
         if row is None or row.status != "sending":
             raise ValueError("invalid delivery claim")
+        now = await self.session.scalar(select(func.now()))
+        if now is None:
+            raise RuntimeError("database clock unavailable")
+        if row.lease_expires_at is None or row.lease_expires_at <= now:
+            row.status = "ambiguous"
+            row.error_code = "lease_expired_manual_reconciliation"
+            row.lease_expires_at = None
+            order = await self.session.get(Order, order_id)
+            if order is not None:
+                order.delivery_status = "ambiguous"
+                order.delivery_error = row.error_code
+            await self.session.commit()
+            raise ValueError("delivery claim expired")
+        return row
+
+    async def mark_photo_sent(
+        self, order_id: int, claim_token: str, photo_message_id: int
+    ) -> None:
+        """Fence and persist the first Telegram operation before sending text."""
+        await self._locked_live_claim(order_id, claim_token)
         order = await self.session.get(Order, order_id)
         if order is None:
             raise ValueError("order not found")
@@ -444,13 +467,7 @@ class OrderService:
     async def mark_delivery_ambiguous(
         self, order_id: int, claim_token: str, error_code: str = "telegram_timeout"
     ) -> None:
-        row = await self.session.scalar(
-            select(Outbox)
-            .where(Outbox.order_id == order_id, Outbox.claim_token == claim_token)
-            .with_for_update()
-        )
-        if row is None or row.status != "sending":
-            raise ValueError("invalid delivery claim")
+        row = await self._locked_live_claim(order_id, claim_token)
         row.status, row.error_code, row.lease_expires_at = "ambiguous", error_code[:120], None
         order = await self.session.get(Order, order_id)
         if order:
@@ -477,9 +494,7 @@ class OrderService:
         photo_message_id: int,
         text_message_id: int | None = None,
     ) -> None:
-        row = await self.session.scalar(select(Outbox).where(Outbox.order_id == order_id, Outbox.claim_token == claim_token).with_for_update())
-        if row is None or row.status != "sending":
-            raise ValueError("invalid delivery claim")
+        row = await self._locked_live_claim(order_id, claim_token)
         row.status = "sent"
         order = await self.session.get(Order, order_id)
         if order:
@@ -500,9 +515,7 @@ class OrderService:
         *,
         retry_at: datetime | None = None,
     ) -> None:
-        row = await self.session.scalar(select(Outbox).where(Outbox.order_id == order_id, Outbox.claim_token == claim_token).with_for_update())
-        if row is None or row.status != "sending":
-            raise ValueError("invalid delivery claim")
+        row = await self._locked_live_claim(order_id, claim_token)
         row.status, row.error_code, row.lease_expires_at, row.next_attempt_at = (
             ("pending" if retry_at else "failed"),
             error_code[:120],

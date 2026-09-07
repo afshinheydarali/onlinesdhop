@@ -157,13 +157,29 @@ class DeliveryWorker:
                 text_id = await self.transport.send_text(order, photo_id)
                 await service.mark_sent(claim, photo_id, text_id)
             except AmbiguousDeliveryError:
-                await service.mark_ambiguous(claim)
+                try:
+                    await service.mark_ambiguous(claim)
+                except ValueError:
+                    return True
             except (TimeoutError, asyncio.TimeoutError, ConnectionError):
-                await service.mark_ambiguous(claim)
+                try:
+                    await service.mark_ambiguous(claim)
+                except ValueError:
+                    return True
             except TransientDeliveryError as exc:
-                await service.mark_failed(claim, "transient", exc.retry_after)
+                try:
+                    await service.mark_failed(claim, "transient", exc.retry_after)
+                except ValueError:
+                    return True
+            except ValueError:
+                # The claim validator may have fenced this worker after its
+                # lease expired and persisted an ambiguous recovery item.
+                return True
             except Exception:
-                await service.mark_failed(claim, "delivery_error")
+                try:
+                    await service.mark_failed(claim, "delivery_error")
+                except ValueError:
+                    return True
             return True
 
 
