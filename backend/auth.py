@@ -62,9 +62,7 @@ async def current_actor(token: str = Depends(oauth2)) -> Actor:
         if type(token_version) is not int or token_version < 0:
             raise ValueError("invalid token version")
     except (jwt.PyJWTError, KeyError, ValueError, TypeError):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid authentication"
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid authentication")
     async with SessionFactory() as session:
         user = await session.get(User, user_id)
         if user is None or not user.is_active or user.token_version != token_version:

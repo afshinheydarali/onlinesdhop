@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Any, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.routing import APIRoute
 from fastapi.security import OAuth2PasswordRequestForm
 from pwdlib.exceptions import UnknownHashError
@@ -18,6 +18,11 @@ from backend.auth import (
 )
 from backend.db import SessionFactory
 from backend.models import Admin, InventoryBalance, Order, Product, User
+from backend.services.fulfillment import (
+    FulfillmentService,
+    InvalidFulfillmentTransition,
+    ReportService,
+)
 from backend.services.orders import (
     Actor,
     CartLine,
@@ -36,6 +41,10 @@ ROUTE_PERMISSIONS = {
     "GET /api/v1/products": "owner|manager|seller|warehouse",
     "GET /api/v1/orders/{public_id}": "owner|manager|seller|warehouse",
     "GET /api/v1/orders": "owner|manager|seller|warehouse",
+    "GET /api/v1/orders/{public_id}/fulfillment": "owner|manager|warehouse",
+    "PATCH /api/v1/orders/{public_id}/fulfillment": "owner|manager|warehouse",
+    "GET /api/v1/reports/revenue": "owner|manager",
+    "GET /api/v1/reports/revenue.csv": "owner|manager",
     "POST /api/v1/admins": "owner",
     "PATCH /api/v1/admins/{telegram_id}": "owner",
     "POST /api/v1/users": "owner",
@@ -121,6 +130,8 @@ class OrderOut(Strict):
     quantity: int | None = None
     amount: int | None = None
     currency: str | None = None
+    fulfillment_status: str
+    payment_status: str | None = None
 
 
 class Token(Strict):
@@ -131,6 +142,11 @@ class Token(Strict):
 class OrderPage(Strict):
     items: list[OrderOut]
     next_cursor: int | None = None
+
+
+class FulfillmentIn(Strict):
+    status: str = Field(min_length=1, max_length=20)
+    reason: str = Field(min_length=1, max_length=500)
 
 
 def output(order: Order, actor: Actor) -> OrderOut:
@@ -160,6 +176,8 @@ def output(order: Order, actor: Actor) -> OrderOut:
         created_at=order.created_at,
         delivery_status=order.delivery_status,
         delivery_attempts=order.delivery_attempts,
+        fulfillment_status=order.fulfillment_status,
+        payment_status=(order.payment_status if actor.role in {"owner", "manager"} else None),
         delivery_error=(None if warehouse or not order.delivery_error else ("delivery_failed" if seller else order.delivery_error)),
         **cast(Any, fields),
     )
@@ -172,6 +190,11 @@ async def value_error(_: Request, exc: ValueError) -> JSONResponse:
 
 @app.exception_handler(IdempotencyConflict)
 async def idempotency_conflict(_: Request, exc: IdempotencyConflict) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+@app.exception_handler(InvalidFulfillmentTransition)
+async def fulfillment_conflict(_: Request, exc: InvalidFulfillmentTransition) -> JSONResponse:
     return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 
@@ -325,6 +348,67 @@ async def list_orders(
             items=[output(o, actor) for o in orders],
             next_cursor=orders[-1].id if len(orders) == limit else None,
         )
+
+
+@app.get("/api/v1/orders/{public_id}/fulfillment")
+async def get_fulfillment(public_id: str, actor: Actor = Depends(require("owner", "manager", "warehouse"))) -> dict[str, Any]:  # noqa: B008
+    async with SessionFactory() as s:
+        order = await OrderService(s).get_order(public_id, actor)
+        if order is None:
+            raise HTTPException(404, "order not found")
+        return {"public_id": order.public_id, "fulfillment_status": order.fulfillment_status, "delivery_status": order.delivery_status}
+
+
+@app.patch("/api/v1/orders/{public_id}/fulfillment")
+async def transition_fulfillment(public_id: str, payload: FulfillmentIn, actor: Actor = Depends(require("owner", "manager", "warehouse"))) -> dict[str, Any]:  # noqa: B008
+    async with SessionFactory() as s:
+        try:
+            result = await FulfillmentService(s).transition(public_id, payload.status, actor, payload.reason)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc))
+        return {"public_id": result.order.public_id, "fulfillment_status": result.order.fulfillment_status, "changed": result.changed}
+
+
+@app.get("/api/v1/reports/revenue")
+async def revenue_report(
+    start: datetime = Query(...),
+    end: datetime = Query(...),
+    seller_id: int | None = Query(None, ge=1),
+    status: str | None = Query(None, min_length=1, max_length=20),
+    limit: int = Query(100, ge=1, le=100),
+    cursor: int | None = Query(None, ge=1),
+    actor: Actor = Depends(require("owner", "manager")),  # noqa: B008
+) -> dict[str, Any]:
+    async with SessionFactory() as s:
+        report = await ReportService(s).revenue(start=start, end=end, seller_id=seller_id, status=status, limit=limit, cursor=cursor)
+        rows = cast(list[Any], report.pop("items"))
+        report["items"] = [
+            {
+                "order_id": o.public_id,
+                "created_at": o.created_at,
+                "seller_id": o.created_by_id,
+                "fulfillment_status": o.fulfillment_status,
+                "amount": o.amount,
+                "currency": o.currency,
+            }
+            for o in rows
+        ]
+        return report
+
+
+@app.get("/api/v1/reports/revenue.csv")
+async def revenue_report_csv(
+    start: datetime = Query(...),
+    end: datetime = Query(...),
+    seller_id: int | None = Query(None, ge=1),
+    status: str | None = Query(None, min_length=1, max_length=20),
+    limit: int = Query(100, ge=1, le=100),
+    cursor: int | None = Query(None, ge=1),
+    actor: Actor = Depends(require("owner", "manager")),  # noqa: B008
+) -> Response:
+    async with SessionFactory() as s:
+        body = await ReportService(s).csv(start=start, end=end, seller_id=seller_id, status=status, limit=limit, cursor=cursor)
+    return Response(content=body, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=revenue.csv"})
 
 
 @app.post("/api/v1/admins", status_code=201)

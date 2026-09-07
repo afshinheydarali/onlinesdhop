@@ -15,6 +15,11 @@ decision.
 | `PATCH /api/v1/orders/{public_id}/fulfillment` | yes | yes | no | yes, minimum fields |
 | `GET /health/live` | public process check | public process check | public process check | public process check |
 
+Financial revenue reports (`GET /api/v1/reports/revenue` and
+`GET /api/v1/reports/revenue.csv`) are owner/manager only. Fulfillment detail
+and transitions are owner/manager/warehouse only; sellers retain their own
+recovery order views and receive no payment, address, or customer fields.
+
 Seller responses expose only recovery data for orders they created: public ID,
 creation time, delivery status, attempt outcome, and retry eligibility. They do
 not expose another seller's existence, customer name, phone, address, or
