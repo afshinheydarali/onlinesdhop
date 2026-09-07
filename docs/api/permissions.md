@@ -14,11 +14,16 @@ decision.
 | `PATCH /api/v1/admins/{telegram_id}` | yes | no | no | no |
 | `PATCH /api/v1/orders/{public_id}/fulfillment` | yes | yes | no | yes, minimum fields |
 | `GET /health/live` | public process check | public process check | public process check | public process check |
+| `GET /health/ready` | public dependency check | public dependency check | public dependency check | public dependency check |
+| `GET /metrics` | yes | yes | no | no |
 
 Financial revenue reports (`GET /api/v1/reports/revenue` and
 `GET /api/v1/reports/revenue.csv`) are owner/manager only. Fulfillment detail
 and transitions are owner/manager/warehouse only; sellers retain their own
 recovery order views and receive no payment, address, or customer fields.
+Operational metrics are owner/manager only; they expose aggregate request,
+delivery, and pool state and are not a public health endpoint. Liveness and
+database readiness remain public checks.
 
 Seller responses expose only recovery data for orders they created: public ID,
 creation time, delivery status, attempt outcome, and retry eligibility. They do
