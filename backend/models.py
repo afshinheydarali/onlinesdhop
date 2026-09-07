@@ -234,6 +234,32 @@ class PaymentReconciliation(Base):
     )
 
 
+class PaymentEvent(Base):
+    """Immutable signed provider callback receipt and replay fingerprint."""
+
+    __tablename__ = "payment_events"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    provider: Mapped[str] = mapped_column(String(40), default="fake")
+    provider_event_id: Mapped[str] = mapped_column(String(200))
+    provider_transaction_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    order_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("orders.id", ondelete="SET NULL"), nullable=True
+    )
+    payment_attempt_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("payment_attempts.id", ondelete="SET NULL"), nullable=True
+    )
+    payload_fingerprint: Mapped[str] = mapped_column(String(64))
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_event_id", name="uq_payment_event_provider_event"),
+        Index("ix_payment_events_provider_transaction", "provider", "provider_transaction_id"),
+    )
+
+
+# Compatibility name used by older adapters.
+PaymentWebhookEvent = PaymentEvent
+
+
 class StockMovement(Base):
     __tablename__ = "stock_movements"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)

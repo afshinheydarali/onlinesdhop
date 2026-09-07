@@ -29,7 +29,7 @@ class FulfillmentPGTests(unittest.IsolatedAsyncioTestCase):
         async with self.engine.begin() as connection:
             await connection.execute(
                 text(
-                    "TRUNCATE payment_reconciliations,fulfillment_transitions,payment_attempts,stock_movements,reservations,"
+                    "TRUNCATE payment_events,payment_reconciliations,fulfillment_transitions,payment_attempts,stock_movements,reservations,"
                     "order_items,inventory_balances,products,outbox,idempotency_keys,orders,users RESTART IDENTITY CASCADE"
                 )
             )
@@ -189,7 +189,7 @@ class FulfillmentPGTests(unittest.IsolatedAsyncioTestCase):
         async with self.sf() as session:
             order = await session.scalar(select(Order).where(Order.public_id == public_id))
             order.payment_status = "paid"
-            session.add(PaymentAttempt(order_id=order.id, amount=order.amount, currency="IRR", status="succeeded", provider="fake"))
+            session.add(PaymentAttempt(order_id=order.id, amount=order.amount, currency="IRR", status="paid", provider="fake"))
             await session.commit()
         async with self.sf() as session:
             service = FulfillmentService(session)
@@ -249,6 +249,7 @@ class FulfillmentPGTests(unittest.IsolatedAsyncioTestCase):
         from backend.models import FulfillmentTransition, InventoryBalance, Order, PaymentReconciliation, Reservation, StockMovement
         from backend.services.fulfillment import FulfillmentService
         from backend.services.orders import Actor
+        from backend.services.payments import FakeGateway, PaymentService
 
         async def race_expiry() -> None:
             public_id = await self.order("race-expiry")
@@ -261,12 +262,14 @@ class FulfillmentPGTests(unittest.IsolatedAsyncioTestCase):
             async def pay() -> None:
                 async with self.sf() as session:
                     await barrier.wait()
-                    await FulfillmentService(session).record_payment(
-                        public_id,
+                    raw = FakeGateway.payload(
+                        order_id=public_id,
                         amount=200,
                         provider_event_id="race-expiry-event",
                         provider_transaction_id="race-expiry-tx",
-                        payload_fingerprint="race-expiry-payload",
+                    )
+                    await PaymentService(session, secret="race-secret").apply_callback(
+                        raw, FakeGateway.sign(raw, "race-secret")
                     )
 
             async def expire() -> None:
@@ -296,12 +299,14 @@ class FulfillmentPGTests(unittest.IsolatedAsyncioTestCase):
             async def pay() -> None:
                 async with self.sf() as session:
                     await barrier.wait()
-                    await FulfillmentService(session).record_payment(
-                        public_id,
+                    raw = FakeGateway.payload(
+                        order_id=public_id,
                         amount=200,
                         provider_event_id="race-cancel-event",
                         provider_transaction_id="race-cancel-tx",
-                        payload_fingerprint="race-cancel-payload",
+                    )
+                    await PaymentService(session, secret="race-secret").apply_callback(
+                        raw, FakeGateway.sign(raw, "race-secret")
                     )
 
             async def cancel() -> None:

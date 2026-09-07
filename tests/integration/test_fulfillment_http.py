@@ -31,7 +31,7 @@ class FulfillmentHTTPTests(unittest.IsolatedAsyncioTestCase):
         async with self.engine.begin() as connection:
             await connection.execute(
                 text(
-                    "TRUNCATE payment_reconciliations,fulfillment_transitions,payment_attempts,stock_movements,reservations,"
+                    "TRUNCATE payment_events,payment_reconciliations,fulfillment_transitions,payment_attempts,stock_movements,reservations,"
                     "order_items,inventory_balances,products,outbox,idempotency_keys,orders,users RESTART IDENTITY CASCADE"
                 )
             )
