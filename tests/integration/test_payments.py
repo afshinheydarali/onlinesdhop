@@ -31,7 +31,9 @@ class PaymentPostgresTests(unittest.IsolatedAsyncioTestCase):
         self.engine = create_async_engine(guarded_url(DB), poolclass=NullPool)
         async with self.engine.begin() as connection:
             await connection.execute(text(
-                "TRUNCATE TABLE payment_events, payment_attempts, outbox, idempotency_keys, orders, admins, users RESTART IDENTITY CASCADE"
+                "TRUNCATE TABLE payment_events, payment_attempts, stock_movements, reservations, "
+                "inventory_balances, products, outbox, idempotency_keys, orders, admins, users "
+                "RESTART IDENTITY CASCADE"
             ))
         self.sf = async_sessionmaker(self.engine, expire_on_commit=False)
         from backend.models import Order, Outbox, User
@@ -61,6 +63,20 @@ class PaymentPostgresTests(unittest.IsolatedAsyncioTestCase):
         from backend.services.payments import FakeGateway
 
         return FakeGateway.payload(order_id="ORD-PAYMENT-1", amount=amount, provider_transaction_id=tx, provider_event_id=event)
+
+    async def add_reservation(self, *, expires_at: datetime | None = None) -> None:
+        from backend.models import InventoryBalance, Order, Product, Reservation
+
+        async with self.sf() as session:
+            order = await session.scalar(select(Order).where(Order.public_id == "ORD-PAYMENT-1"))
+            product = Product(sku="PAYMENT-WIDGET", name="Payment Widget", unit_price=1000, currency="IRR", is_active=True)
+            session.add(product)
+            await session.flush()
+            session.add_all([
+                InventoryBalance(product_id=product.id, on_hand=1, reserved=1),
+                Reservation(order_id=order.id, product_id=product.id, quantity=1, status="reserved", expires_at=expires_at),
+            ])
+            await session.commit()
 
     async def test_valid_replay_and_invalid_inputs_have_one_effect(self) -> None:
         from backend.models import Order, PaymentAttempt, PaymentEvent
@@ -92,6 +108,81 @@ class PaymentPostgresTests(unittest.IsolatedAsyncioTestCase):
         async with self.sf() as session:
             self.assertEqual(await session.scalar(select(func.count()).select_from(PaymentAttempt)), 1)
             self.assertEqual(await session.scalar(select(func.count()).select_from(PaymentEvent)), 1)
+
+    async def test_invalid_binding_cases_have_zero_mutation(self) -> None:
+        """Every rejected callback is checked against all payment tables."""
+        from backend.models import Order, PaymentAttempt, PaymentEvent
+        from backend.services.payments import FakeGateway, InvalidPaymentSignature, PaymentError, PaymentService
+
+        async def counts(session):
+            return tuple(
+                await session.scalar(select(func.count()).select_from(table))
+                for table in (Order, PaymentAttempt, PaymentEvent)
+            )
+
+        async with self.sf() as session:
+            before = await counts(session)
+
+        cases = [
+            ("bad-signature", self.raw(event="bad-signature"), InvalidPaymentSignature, "sha256=" + "00" * 32),
+            ("wrong-amount", self.raw(event="wrong-amount", amount=999), PaymentError, None),
+            (
+                "wrong-currency",
+                FakeGateway.payload(
+                    order_id="ORD-PAYMENT-1", amount=1000, currency="USD",
+                    provider_transaction_id="wrong-currency", provider_event_id="wrong-currency",
+                ),
+                PaymentError,
+                None,
+            ),
+            (
+                "unknown-order",
+                FakeGateway.payload(
+                    order_id="ORD-MISSING", amount=1000,
+                    provider_transaction_id="unknown-order", provider_event_id="unknown-order",
+                ),
+                PaymentError,
+                None,
+            ),
+        ]
+        for _, raw, error, signature in cases:
+            async with self.sf() as session:
+                with self.assertRaises(error):
+                    await PaymentService(session, secret=self.secret).apply_callback(
+                        raw, signature or FakeGateway.sign(raw, self.secret)
+                    )
+                await session.rollback()
+            async with self.sf() as session:
+                self.assertEqual(await counts(session), before)
+
+    async def test_changed_event_payload_and_transaction_binding_are_fenced(self) -> None:
+        from backend.models import PaymentAttempt, PaymentEvent
+        from backend.services.payments import FakeGateway, PaymentConflict, PaymentService
+
+        raw = self.raw(event="binding-event", tx="binding-tx")
+        async with self.sf() as session:
+            await PaymentService(session, secret=self.secret).apply_callback(raw, FakeGateway.sign(raw, self.secret))
+        changed_event = FakeGateway.payload(
+            order_id="ORD-PAYMENT-1", amount=1000, provider_transaction_id="binding-tx",
+            provider_event_id="binding-event", status="failed",
+        )
+        async with self.sf() as session:
+            with self.assertRaises(PaymentConflict):
+                await PaymentService(session, secret=self.secret).apply_callback(
+                    changed_event, FakeGateway.sign(changed_event, self.secret)
+                )
+            await session.rollback()
+        # A transaction already bound to this order can be delivered by a
+        # second event, but it must not create another attempt or apply twice.
+        second_event = self.raw(event="binding-event-2", tx="binding-tx")
+        async with self.sf() as session:
+            result = await PaymentService(session, secret=self.secret).apply_callback(
+                second_event, FakeGateway.sign(second_event, self.secret)
+            )
+            self.assertEqual(result.status, "duplicate")
+            self.assertFalse(result.applied)
+            self.assertEqual(await session.scalar(select(func.count()).select_from(PaymentAttempt)), 1)
+            self.assertEqual(await session.scalar(select(func.count()).select_from(PaymentEvent)), 2)
 
     async def test_second_event_same_transaction_is_deduplicated_concurrently(self) -> None:
         from backend.models import PaymentAttempt
@@ -137,17 +228,117 @@ class PaymentPostgresTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status_code, 200)
 
     async def test_late_payment_is_reconciliation_and_order_stays_expired(self) -> None:
-        from backend.models import Order
+        from backend.models import InventoryBalance, Order, Reservation, StockMovement
         from backend.services.payments import FakeGateway, PaymentService
 
         async with self.sf() as session:
             order = await session.scalar(select(Order).where(Order.public_id == "ORD-PAYMENT-1"))
             order.expires_at = datetime.now(UTC) - timedelta(seconds=1)
             await session.commit()
+        await self.add_reservation(expires_at=datetime.now(UTC) - timedelta(seconds=1))
         raw = self.raw(event="late-event", tx="late-transaction")
         async with self.sf() as session:
             result = await PaymentService(session, secret=self.secret).apply_callback(raw, FakeGateway.sign(raw, self.secret))
             order = await session.scalar(select(Order).where(Order.public_id == "ORD-PAYMENT-1"))
             self.assertEqual(result.status, "reconciliation")
-            self.assertEqual(order.payment_status, "reconciliation")
+            self.assertEqual(order.payment_status, "paid")
+            self.assertTrue(order.reconciliation_required)
             self.assertEqual(order.fulfillment_status, "expired")
+            balance = await session.scalar(select(InventoryBalance))
+            reservation = await session.scalar(select(Reservation))
+            self.assertEqual(balance.reserved, 0)
+            self.assertEqual(reservation.status, "expired")
+            self.assertEqual(
+                await session.scalar(select(func.count()).select_from(StockMovement).where(StockMovement.movement_type == "release")),
+                1,
+            )
+
+    async def test_payment_vs_expiry_order_lock_makes_late_money_reconciliation(self) -> None:
+        from backend.models import InventoryBalance, Order, Reservation
+        from backend.services.payments import FakeGateway, PaymentService
+
+        expiry_has_lock = asyncio.Event()
+        release_expiry = asyncio.Event()
+        payment_started = asyncio.Event()
+        await self.add_reservation(expires_at=datetime.now(UTC) - timedelta(seconds=1))
+
+        async def expire_first() -> None:
+            async with self.sf() as session:
+                order = await session.scalar(select(Order).where(Order.public_id == "ORD-PAYMENT-1").with_for_update())
+                expiry_has_lock.set()
+                await release_expiry.wait()
+                order.fulfillment_status = "expired"
+                await session.commit()
+
+        async def payment_after_expiry_lock():
+            await expiry_has_lock.wait()
+            payment_started.set()
+            raw = self.raw(event="race-expiry", tx="race-expiry-tx")
+            async with self.sf() as session:
+                return await PaymentService(session, secret=self.secret).apply_callback(raw, FakeGateway.sign(raw, self.secret))
+
+        expiry_task = asyncio.create_task(expire_first())
+        await expiry_has_lock.wait()
+        payment_task = asyncio.create_task(payment_after_expiry_lock())
+        await payment_started.wait()
+        release_expiry.set()
+        result = await asyncio.wait_for(payment_task, 10)
+        await asyncio.wait_for(expiry_task, 10)
+        self.assertEqual(result.status, "reconciliation")
+        async with self.sf() as session:
+            order = await session.scalar(select(Order).where(Order.public_id == "ORD-PAYMENT-1"))
+            balance = await session.scalar(select(InventoryBalance))
+            reservation = await session.scalar(select(Reservation))
+            self.assertEqual(order.fulfillment_status, "expired")
+            self.assertEqual((balance.reserved, reservation.status), (0, "expired"))
+
+    async def test_payment_vs_cancel_order_lock_never_revives_or_rereserves(self) -> None:
+        from backend.models import InventoryBalance, Order, Reservation, StockMovement
+        from backend.services.payments import FakeGateway, PaymentService
+
+        cancel_has_lock = asyncio.Event()
+        release_cancel = asyncio.Event()
+        payment_started = asyncio.Event()
+        await self.add_reservation()
+
+        async def cancel_first() -> None:
+            async with self.sf() as session:
+                order = await session.scalar(select(Order).where(Order.public_id == "ORD-PAYMENT-1").with_for_update())
+                reservations = list(
+                    (
+                        await session.scalars(
+                            select(Reservation)
+                            .where(Reservation.order_id == order.id)
+                            .order_by(Reservation.product_id)
+                            .with_for_update()
+                        )
+                    ).all()
+                )
+                service = PaymentService(session, secret=self.secret)
+                cancel_has_lock.set()
+                await release_cancel.wait()
+                await service._release_reserved(order, reservations, status="released", at=datetime.now(UTC))
+                order.fulfillment_status = "cancelled"
+                await session.commit()
+
+        async def payment_after_cancel_lock():
+            await cancel_has_lock.wait()
+            payment_started.set()
+            raw = self.raw(event="race-cancel", tx="race-cancel-tx")
+            async with self.sf() as session:
+                return await PaymentService(session, secret=self.secret).apply_callback(raw, FakeGateway.sign(raw, self.secret))
+
+        cancel_task = asyncio.create_task(cancel_first())
+        await cancel_has_lock.wait()
+        payment_task = asyncio.create_task(payment_after_cancel_lock())
+        await payment_started.wait()
+        release_cancel.set()
+        result = await asyncio.wait_for(payment_task, 10)
+        await asyncio.wait_for(cancel_task, 10)
+        self.assertEqual(result.status, "reconciliation")
+        async with self.sf() as session:
+            order = await session.scalar(select(Order).where(Order.public_id == "ORD-PAYMENT-1"))
+            balance = await session.scalar(select(InventoryBalance))
+            self.assertEqual((order.fulfillment_status, order.payment_status), ("cancelled", "paid"))
+            self.assertEqual(balance.reserved, 0)
+            self.assertEqual(await session.scalar(select(func.count()).select_from(StockMovement).where(StockMovement.movement_type == "release")), 1)

@@ -16,10 +16,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.models import Order, PaymentAttempt, PaymentEvent, Reservation
+from backend.models import InventoryBalance, Order, PaymentAttempt, PaymentEvent, Reservation, StockMovement
 
 
 class PaymentError(ValueError):
@@ -123,6 +123,46 @@ class PaymentService:
             secret = secret.encode("utf-8")
         self.secret = secret
 
+    async def _release_reserved(
+        self, order: Order, reservations: list[Reservation], *, status: str, at: datetime
+    ) -> None:
+        """Release this order's remaining reservation while holding its row lock.
+
+        Payment, cancellation and expiry all acquire the order row first.  The
+        reservation and balance rows are then locked in product order so a late
+        callback cannot leave reserved stock behind or deadlock with fulfillment.
+        """
+        active = [r for r in reservations if r.status == "reserved"]
+        product_ids = sorted({r.product_id for r in active})
+        if not product_ids:
+            return
+        balances = {
+            balance.product_id: balance
+            for balance in (
+                await self.session.scalars(
+                    select(InventoryBalance)
+                    .where(InventoryBalance.product_id.in_(product_ids))
+                    .order_by(InventoryBalance.product_id)
+                    .with_for_update()
+                )
+            ).all()
+        }
+        for reservation in active:
+            balance = balances.get(reservation.product_id)
+            if balance is None or balance.reserved < reservation.quantity:
+                raise RuntimeError("reservation invariant violated")
+            balance.reserved -= reservation.quantity
+            reservation.status = status
+            self.session.add(
+                StockMovement(
+                    product_id=reservation.product_id,
+                    order_id=order.id,
+                    quantity=reservation.quantity,
+                    movement_type="release",
+                    created_at=at,
+                )
+            )
+
     async def apply_callback(self, raw_body: bytes, signature: str) -> PaymentResult:
         secret = self.secret if self.secret is not None else payment_hmac_secret()
         try:
@@ -181,12 +221,19 @@ class PaymentService:
             await self.session.commit()
             return PaymentResult(event_id, order.id, "duplicate", False)
 
-        now = datetime.now(UTC)
+        # Use the database clock that also governs expiry workers.  App clocks
+        # can differ between callback and fulfillment processes.
+        now = await self.session.scalar(select(func.now()))
+        if now is None:
+            raise RuntimeError("database clock unavailable")
         late_reason: str | None = None
         reservations = list(
             (
                 await self.session.scalars(
-                    select(Reservation).where(Reservation.order_id == order.id).with_for_update()
+                    select(Reservation)
+                    .where(Reservation.order_id == order.id)
+                    .order_by(Reservation.product_id)
+                    .with_for_update()
                 )
             ).all()
         )
@@ -208,6 +255,13 @@ class PaymentService:
             if order.fulfillment_status in {"draft", "confirmed"}:
                 order.fulfillment_status = "expired"
 
+        if late_reason:
+            release_status = "expired" if "expired" in late_reason else "released"
+            await self._release_reserved(order, reservations, status=release_status, at=now)
+            order.reconciliation_required = True
+            if release_status == "expired":
+                order.expired_at = now
+
         status = "reconciliation" if late_reason else ("paid" if payload["status"] == "success" else "failed")
         attempt = PaymentAttempt(
             order_id=order.id, provider="fake", provider_transaction_id=transaction_id,
@@ -223,7 +277,10 @@ class PaymentService:
             payment_attempt_id=attempt.id, received_at=now,
         ))
         if late_reason:
-            order.payment_status = "reconciliation"
+            # Reconciliation is orthogonal to the provider's verified payment
+            # state.  Keep the order vocabulary compatible with fulfillment.
+            order.reconciliation_required = True
+            order.payment_status = "paid" if payload["status"] == "success" else "failed"
         elif status == "paid":
             order.payment_status = "paid"
         else:

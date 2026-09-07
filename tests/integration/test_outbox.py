@@ -92,6 +92,43 @@ class OutboxPostgresTests(unittest.IsolatedAsyncioTestCase):
                 await OrderService(session).mark_delivery_sent(valid.order_id, "stale-token", 501, 601)
             await session.rollback()
 
+    async def test_live_lease_is_unstealable_and_expired_uncertain_is_ambiguous(self) -> None:
+        from backend.models import Order, Outbox
+        from backend.services.delivery import DeliveryService
+
+        async with self.sf() as session:
+            first = await DeliveryService(session).claim_next(worker_id="live", lease_seconds=120)
+            self.assertIsNotNone(first)
+        async with self.sf() as session:
+            self.assertIsNone(await DeliveryService(session).claim_next(worker_id="thief"))
+        async with self.sf() as session:
+            row = await session.scalar(select(Outbox))
+            row.lease_expires_at = datetime.now(UTC)
+            await session.commit()
+        async with self.sf() as session:
+            self.assertIsNone(await DeliveryService(session).claim_next(worker_id="recovery"))
+        async with self.sf() as session:
+            row = await session.scalar(select(Outbox))
+            order = await session.scalar(select(Order))
+            self.assertEqual((row.status, row.error_code, order.delivery_status), ("ambiguous", "lease_expired_manual_reconciliation", "ambiguous"))
+
+    async def test_attempt_cap_and_rate_hint_are_bounded(self) -> None:
+        from backend.models import Outbox
+        from backend.services.delivery import DeliveryService
+
+        async with self.sf() as session:
+            row = await session.scalar(select(Outbox))
+            row.status, row.attempts, row.next_attempt_at = "pending", 5, datetime.now(UTC)
+            await session.commit()
+        async with self.sf() as session:
+            self.assertIsNone(await DeliveryService(session).claim_next(worker_id="capped"))
+            row = await session.scalar(select(Outbox))
+            self.assertEqual((row.status, row.error_code, row.next_attempt_at), ("failed", "attempt_limit", None))
+        before = datetime.now(UTC)
+        retry_at = DeliveryService._backoff(1, 10**9)
+        self.assertGreaterEqual((retry_at - before).total_seconds(), 3600)
+        self.assertLess((retry_at - before).total_seconds(), 3602)
+
     async def test_photo_is_persisted_before_retrying_text(self) -> None:
         from backend.models import Order, Outbox
         from backend.services.delivery import DeliveryWorker

@@ -13,9 +13,11 @@ def upgrade() -> None:
     op.add_column("orders", sa.Column("payment_status", sa.String(24), nullable=False, server_default="pending"))
     op.add_column("orders", sa.Column("fulfillment_status", sa.String(24), nullable=False, server_default="confirmed"))
     op.add_column("orders", sa.Column("expires_at", sa.DateTime(timezone=True), nullable=True))
+    op.add_column("orders", sa.Column("expired_at", sa.DateTime(timezone=True), nullable=True))
+    op.add_column("orders", sa.Column("reconciliation_required", sa.Boolean(), nullable=False, server_default=sa.false()))
     op.create_check_constraint(
         "ck_orders_payment_status", "orders",
-        "payment_status IN ('pending','paid','failed','refunded','reconciliation')",
+        "payment_status IN ('pending','paid','failed','refunded')",
     )
     op.create_check_constraint(
         "ck_orders_fulfillment_status", "orders",
@@ -58,5 +60,7 @@ def downgrade() -> None:
     op.drop_constraint("ck_orders_fulfillment_status", "orders", type_="check")
     op.drop_constraint("ck_orders_payment_status", "orders", type_="check")
     op.drop_column("orders", "expires_at")
+    op.drop_column("orders", "expired_at")
+    op.drop_column("orders", "reconciliation_required")
     op.drop_column("orders", "fulfillment_status")
     op.drop_column("orders", "payment_status")

@@ -75,6 +75,8 @@ class Order(Base):
     # Lifecycle fields are additive to the legacy free-text order shape.
     payment_status: Mapped[str] = mapped_column(String(24), default="pending")
     fulfillment_status: Mapped[str] = mapped_column(String(24), default="confirmed")
+    reconciliation_required: Mapped[bool] = mapped_column(Boolean, default=False)
+    expired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
         CheckConstraint("quantity > 0", name="ck_orders_quantity_positive"),
@@ -84,7 +86,7 @@ class Order(Base):
             name="ck_orders_delivery_status",
         ),
         CheckConstraint(
-            "payment_status IN ('pending','paid','failed','refunded','reconciliation')",
+            "payment_status IN ('pending','paid','failed','refunded')",
             name="ck_orders_payment_status",
         ),
         CheckConstraint(
@@ -233,5 +235,5 @@ class StockMovement(Base):
     __table_args__ = (
         CheckConstraint("quantity > 0", name="ck_stock_movements_quantity_positive"),
         CheckConstraint("movement_type IN ('reserve','release','consume','adjust')", name="ck_stock_movements_type"),
-        Index("uq_stock_movement_order_product_type", "order_id", "product_id", "movement_type", unique=True),
+        UniqueConstraint("order_id", "product_id", "movement_type", name="uq_stock_movement_order_product_type"),
     )

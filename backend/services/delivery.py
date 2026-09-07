@@ -63,8 +63,13 @@ class DeliveryService:
                 or_(
                     Outbox.status == "pending",
                     and_(Outbox.status == "failed", Outbox.next_attempt_at.is_not(None)),
+                    and_(Outbox.status == "sending", Outbox.lease_expires_at <= now),
                 ),
-                or_(Outbox.next_attempt_at.is_(None), Outbox.next_attempt_at <= now),
+                or_(
+                    Outbox.status == "sending",
+                    Outbox.next_attempt_at.is_(None),
+                    Outbox.next_attempt_at <= now,
+                ),
             )
             .order_by(Outbox.id)
             .limit(1)
@@ -72,6 +77,18 @@ class DeliveryService:
         )
         if row is None:
             await self.session.rollback()
+            return None
+        if row.status == "sending":
+            # A transport timeout is uncertain.  Once its lease expires, make
+            # it explicitly reconcilable instead of silently retrying it.
+            row.status = "ambiguous"
+            row.error_code = "lease_expired_manual_reconciliation"
+            row.lease_expires_at = None
+            order = await self.session.get(Order, row.order_id)
+            if order is not None:
+                order.delivery_status = "ambiguous"
+                order.delivery_error = row.error_code
+            await self.session.commit()
             return None
         if row.attempts >= self.MAX_ATTEMPTS:
             row.status, row.error_code, row.next_attempt_at = "failed", "attempt_limit", None
