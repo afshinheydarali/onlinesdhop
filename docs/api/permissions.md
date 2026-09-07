@@ -37,6 +37,12 @@ Authentication requirements:
 - Malformed or invalid business payload: `422`.
 - Reused idempotency key with a different canonical payload: `409`.
 
+The login failure limiter uses the direct socket IP and username in process
+memory. It does not trust `X-Forwarded-For` and is bounded with expiry and a
+fixed entry cap. Deployments with multiple API processes or replicas must add
+an equivalent shared or edge rate limit; the in-process limiter is not a
+cross-process security boundary.
+
 Role lookup is server-side on every request. Token claims cannot elevate a
 seller to manager, and deactivation/revocation takes effect without waiting
 for token expiry. Any new route must add a row to the matrix and a negative

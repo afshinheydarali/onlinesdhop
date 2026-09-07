@@ -6,11 +6,13 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.routing import APIRoute
 from fastapi.security import OAuth2PasswordRequestForm
 from pwdlib.exceptions import UnknownHashError
-from pydantic import BaseModel, ConfigDict, Field, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from backend.auth import (
+    MAX_PASSWORD_BYTES,
+    auth_rate_limiter,
     hash_password_async,
     make_token,
     require,
@@ -112,9 +114,16 @@ class ActiveIn(Strict):
 
 class UserIn(Strict):
     username: str = Field(min_length=1, max_length=120)
-    password: str = Field(min_length=12)
+    password: str = Field(min_length=12, max_length=128)
     role: str
     telegram_id: int | None = None
+
+    @field_validator("password")
+    @classmethod
+    def password_must_fit_hash_limit(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > MAX_PASSWORD_BYTES:
+            raise ValueError(f"password must be at most {MAX_PASSWORD_BYTES} UTF-8 bytes")
+        return value
 
 
 class OrderOut(Strict):
@@ -204,7 +213,15 @@ async def permission_error(_: Request, exc: PermissionError) -> JSONResponse:
 
 
 @app.post("/api/v1/auth/token", response_model=Token)
-async def token(form: Annotated[OAuth2PasswordRequestForm, Depends()]) -> Token:
+async def token(request: Request, form: Annotated[OAuth2PasswordRequestForm, Depends()]) -> Token:
+    direct_ip = request.client.host if request.client is not None else "unknown"
+    retry_after = auth_rate_limiter.check(direct_ip, form.username)
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=429,
+            detail="too many authentication attempts",
+            headers={"Retry-After": str(retry_after)},
+        )
     async with SessionFactory() as s:
         user = await s.scalar(select(User).where(User.username == form.username))
         try:
@@ -212,7 +229,15 @@ async def token(form: Annotated[OAuth2PasswordRequestForm, Depends()]) -> Token:
         except (ValueError, TypeError, UnknownHashError):
             valid = False
         if user is None or not valid or not user.is_active:
+            retry_after = auth_rate_limiter.record_failure(direct_ip, form.username)
+            if retry_after is not None:
+                raise HTTPException(
+                    status_code=429,
+                    detail="too many authentication attempts",
+                    headers={"Retry-After": str(retry_after)},
+                )
             raise HTTPException(status_code=401, detail="incorrect credentials")
+        auth_rate_limiter.record_success(direct_ip, form.username)
         return Token(access_token=make_token(user), token_type="bearer")
 
 
