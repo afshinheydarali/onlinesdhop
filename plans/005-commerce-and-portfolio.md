@@ -46,7 +46,7 @@ Add deterministic synthetic seed, English README, ERD, two or three ADRs explain
 
 Create a reproducible load script or documented tool configuration. Record machine limits, dataset size, request mix, concurrency, duration, p50/p95, throughput, error rate and query counts. Choose a performance budget after a baseline; do not invent '10k RPS' or production-scale claims. Restrict destructive demo endpoints and use synthetic resettable data; keep real Telegram secrets off public demo surfaces.
 
-Verify `python -m unittest tests.integration.test_restore tests.integration.test_demo_smoke -v` -> restored IDs/counts/constraints and smoke flows pass. Verify setup from a clean checkout and the documented benchmark command -> report artifact with actual measurements, then run the full CI gates. The local benchmark artifact records the measured run; external CI remains a pending integration gate until the final branch is pushed by the supervisor. Publishing demo infrastructure is a separate concrete action after this reviewable deliverable exists.
+Verify `python -m unittest tests.integration.test_restore tests.integration.test_demo_smoke -v` -> restored IDs/counts/constraints and smoke flows pass. Verify setup from a clean checkout and the documented benchmark command -> report artifact with actual measurements, then run the full CI gates. The local benchmark artifact records the measured run; final CI run [34134913816](https://github.com/afshinheydarali/onlinesdhop/actions/runs/34134913816) passed on Python 3.11 and 3.12 with 136 tests and zero skips. Publishing demo infrastructure is a separate concrete action after this reviewable deliverable exists.
 
 ## Optional backlog and maintenance
 
