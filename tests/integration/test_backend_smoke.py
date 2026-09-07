@@ -11,7 +11,7 @@ class BackendSmokeTests(unittest.TestCase):
         routes = {
             f"{method} {route.path}"
             for route in app.routes
-            if route.path.startswith(("/api/v1/", "/health/"))
+            if route.path.startswith(("/api/v1/", "/health/")) or route.path == "/metrics"
             for method in getattr(route, "methods", set())
             if method not in {"HEAD", "OPTIONS"}
         }
