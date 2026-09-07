@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import unittest
 from datetime import UTC, datetime, timedelta
@@ -28,7 +29,7 @@ class FulfillmentPGTests(unittest.IsolatedAsyncioTestCase):
         async with self.engine.begin() as connection:
             await connection.execute(
                 text(
-                    "TRUNCATE fulfillment_transitions,payment_attempts,stock_movements,reservations,"
+                    "TRUNCATE payment_reconciliations,fulfillment_transitions,payment_attempts,stock_movements,reservations,"
                     "order_items,inventory_balances,products,outbox,idempotency_keys,orders,users RESTART IDENTITY CASCADE"
                 )
             )
@@ -67,6 +68,32 @@ class FulfillmentPGTests(unittest.IsolatedAsyncioTestCase):
         public_id = await self.order("cancel")
         async with self.sf() as session:
             service = FulfillmentService(session)
+            order = await session.scalar(select(Order).where(Order.public_id == public_id))
+            balance = await session.scalar(select(InventoryBalance))
+            reservation = await session.scalar(select(Reservation))
+            before = (order.fulfillment_status, reservation.status, balance.on_hand, balance.reserved)
+            before_counts = (
+                await session.scalar(select(func.count(Order.id))),
+                await session.scalar(select(func.count(Reservation.id))),
+                await session.scalar(select(func.count(InventoryBalance.product_id))),
+                await session.scalar(select(func.count(StockMovement.id))),
+                await session.scalar(select(func.count(FulfillmentTransition.id))),
+            )
+            with self.assertRaises(InvalidFulfillmentTransition):
+                await service.transition(public_id, "shipped", Actor(self.owner_id, "owner"), "invalid jump")
+            await session.rollback()
+            order = await session.scalar(select(Order).where(Order.public_id == public_id))
+            balance = await session.scalar(select(InventoryBalance))
+            reservation = await session.scalar(select(Reservation))
+            self.assertEqual((order.fulfillment_status, reservation.status, balance.on_hand, balance.reserved), before)
+            after_counts = (
+                await session.scalar(select(func.count(Order.id))),
+                await session.scalar(select(func.count(Reservation.id))),
+                await session.scalar(select(func.count(InventoryBalance.product_id))),
+                await session.scalar(select(func.count(StockMovement.id))),
+                await session.scalar(select(func.count(FulfillmentTransition.id))),
+            )
+            self.assertEqual(after_counts, before_counts)
             first = await service.cancel_order(public_id, Actor(self.owner_id, "owner"))
             second = await service.cancel_order(public_id, Actor(self.owner_id, "owner"))
             self.assertTrue(first.changed)
@@ -110,15 +137,30 @@ class FulfillmentPGTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await session.scalar(select(func.count(StockMovement.id)).where(StockMovement.movement_type == "consume")), 1)
 
     async def test_expiry_releases_once(self) -> None:
-        from backend.models import Reservation
+        from backend.models import FulfillmentTransition, InventoryBalance, Order, Reservation, StockMovement
         from backend.services.fulfillment import FulfillmentService, InvalidFulfillmentTransition
         from backend.services.orders import Actor
 
         public_id = await self.order("expiry")
         async with self.sf() as session:
+            before_counts = (
+                await session.scalar(select(func.count(Order.id))),
+                await session.scalar(select(func.count(Reservation.id))),
+                await session.scalar(select(func.count(InventoryBalance.product_id))),
+                await session.scalar(select(func.count(StockMovement.id))),
+                await session.scalar(select(func.count(FulfillmentTransition.id))),
+            )
             with self.assertRaises(InvalidFulfillmentTransition):
                 await FulfillmentService(session).expire_order(public_id, Actor(self.owner_id, "owner"))
             await session.rollback()
+            after_counts = (
+                await session.scalar(select(func.count(Order.id))),
+                await session.scalar(select(func.count(Reservation.id))),
+                await session.scalar(select(func.count(InventoryBalance.product_id))),
+                await session.scalar(select(func.count(StockMovement.id))),
+                await session.scalar(select(func.count(FulfillmentTransition.id))),
+            )
+            self.assertEqual(after_counts, before_counts)
             reservation = await session.scalar(select(Reservation))
             reservation.expires_at = datetime.now(UTC) - timedelta(minutes=1)
             await session.commit()
@@ -128,9 +170,18 @@ class FulfillmentPGTests(unittest.IsolatedAsyncioTestCase):
             second = await service.expire_order(public_id, Actor(self.owner_id, "owner"), at=datetime.now(UTC))
             self.assertTrue(first.changed)
             self.assertFalse(second.changed)
+        async with self.sf() as session:
+            order = await session.scalar(select(Order).where(Order.public_id == public_id))
+            reservation = await session.scalar(select(Reservation))
+            balance = await session.scalar(select(InventoryBalance))
+            self.assertEqual(order.fulfillment_status, "expired")
+            self.assertEqual(reservation.status, "expired")
+            self.assertEqual(balance.reserved, 0)
+            self.assertEqual(await session.scalar(select(func.count(StockMovement.id)).where(StockMovement.movement_type == "release")), 1)
+            self.assertEqual(await session.scalar(select(func.count(FulfillmentTransition.id))), 1)
 
     async def test_paid_cancellation_requires_reconciliation_without_refund(self) -> None:
-        from backend.models import Order, PaymentAttempt
+        from backend.models import Order, PaymentAttempt, PaymentReconciliation
         from backend.services.fulfillment import FulfillmentService
         from backend.services.orders import Actor
 
@@ -141,12 +192,137 @@ class FulfillmentPGTests(unittest.IsolatedAsyncioTestCase):
             session.add(PaymentAttempt(order_id=order.id, amount=order.amount, currency="IRR", status="succeeded", provider="fake"))
             await session.commit()
         async with self.sf() as session:
-            await FulfillmentService(session).cancel_order(public_id, Actor(self.owner_id, "owner"), "customer changed mind")
+            service = FulfillmentService(session)
+            await service.cancel_order(public_id, Actor(self.owner_id, "owner"), "customer changed mind")
+            await service.cancel_order(public_id, Actor(self.owner_id, "owner"), "replayed cancellation")
         async with self.sf() as session:
             order = await session.scalar(select(Order).where(Order.public_id == public_id))
             self.assertTrue(order.reconciliation_required)
             self.assertEqual(order.payment_status, "paid")
             self.assertNotEqual(order.payment_status, "refunded")
+            reconciliation = await session.scalar(select(PaymentReconciliation).where(PaymentReconciliation.order_id == order.id))
+            self.assertIsNotNone(reconciliation)
+            self.assertEqual(
+                (reconciliation.kind, reconciliation.status, reconciliation.amount, reconciliation.currency),
+                ("refund_required", "open", order.amount, "IRR"),
+            )
+            self.assertEqual(await session.scalar(select(func.count(PaymentReconciliation.id)).where(PaymentReconciliation.order_id == order.id)), 1)
+
+    async def test_service_requires_active_actor_and_exact_role_for_expiry(self) -> None:
+        from backend.models import User
+        from backend.services.fulfillment import FulfillmentService
+        from backend.services.orders import Actor
+
+        public_id = await self.order("authorization")
+        async with self.sf() as session:
+            owner = await session.get(User, self.owner_id)
+            owner.is_active = False
+            await session.commit()
+        async with self.sf() as session:
+            service = FulfillmentService(session)
+            with self.assertRaises(PermissionError):
+                await service.transition(public_id, "confirmed", Actor(self.owner_id, "owner"), "inactive")
+            with self.assertRaises(PermissionError):
+                await service.expire_order(public_id, Actor(self.owner_id, "owner"))
+            with self.assertRaises(PermissionError):
+                await service.transition(public_id, "confirmed", Actor(self.owner_id, "manager"), "wrong role")
+            with self.assertRaises(PermissionError):
+                await service.expire_order(public_id, Actor(self.warehouse_id, "warehouse"))
+            await session.rollback()
+        async with self.sf() as session:
+            owner = await session.get(User, self.owner_id)
+            owner.is_active = True
+            await session.commit()
+
+    async def test_catalog_reservation_expiry_is_persisted(self) -> None:
+        from backend.models import Order, Reservation
+
+        public_id = await self.order("expires-at")
+        async with self.sf() as session:
+            order = await session.scalar(select(Order).where(Order.public_id == public_id))
+            reservation = await session.scalar(select(Reservation).where(Reservation.order_id == order.id))
+            self.assertIsNotNone(reservation.expires_at)
+            self.assertGreater(reservation.expires_at, order.created_at)
+
+    async def test_payment_races_with_expiry_and_cancel_follow_order_lock_policy(self) -> None:
+        from backend.models import FulfillmentTransition, InventoryBalance, Order, PaymentReconciliation, Reservation, StockMovement
+        from backend.services.fulfillment import FulfillmentService
+        from backend.services.orders import Actor
+
+        async def race_expiry() -> None:
+            public_id = await self.order("race-expiry")
+            async with self.sf() as session:
+                reservation = await session.scalar(select(Reservation))
+                reservation.expires_at = datetime.now(UTC) - timedelta(minutes=1)
+                await session.commit()
+            barrier = asyncio.Barrier(2)
+
+            async def pay() -> None:
+                async with self.sf() as session:
+                    await barrier.wait()
+                    await FulfillmentService(session).record_payment(
+                        public_id,
+                        amount=200,
+                        provider_event_id="race-expiry-event",
+                        provider_transaction_id="race-expiry-tx",
+                        payload_fingerprint="race-expiry-payload",
+                    )
+
+            async def expire() -> None:
+                async with self.sf() as session:
+                    await barrier.wait()
+                    await FulfillmentService(session).expire_order(public_id, Actor(self.owner_id, "owner"), at=datetime.now(UTC))
+
+            await asyncio.gather(pay(), expire())
+            async with self.sf() as session:
+                order = await session.scalar(select(Order).where(Order.public_id == public_id))
+                self.assertEqual(order.fulfillment_status, "expired")
+                self.assertEqual(
+                    await session.scalar(
+                        select(func.count(StockMovement.id)).where(StockMovement.order_id == order.id, StockMovement.movement_type == "release")
+                    ),
+                    1,
+                )
+                self.assertEqual(await session.scalar(select(func.count(FulfillmentTransition.id)).where(FulfillmentTransition.order_id == order.id)), 1)
+                self.assertEqual(await session.scalar(select(func.count(PaymentReconciliation.id)).where(PaymentReconciliation.order_id == order.id)), 1)
+                balance = await session.scalar(select(InventoryBalance))
+                self.assertEqual(balance.reserved, 0)
+
+        async def race_cancel() -> None:
+            public_id = await self.order("race-cancel")
+            barrier = asyncio.Barrier(2)
+
+            async def pay() -> None:
+                async with self.sf() as session:
+                    await barrier.wait()
+                    await FulfillmentService(session).record_payment(
+                        public_id,
+                        amount=200,
+                        provider_event_id="race-cancel-event",
+                        provider_transaction_id="race-cancel-tx",
+                        payload_fingerprint="race-cancel-payload",
+                    )
+
+            async def cancel() -> None:
+                async with self.sf() as session:
+                    await barrier.wait()
+                    await FulfillmentService(session).cancel_order(public_id, Actor(self.owner_id, "owner"), "race cancellation")
+
+            await asyncio.gather(pay(), cancel())
+            async with self.sf() as session:
+                order = await session.scalar(select(Order).where(Order.public_id == public_id))
+                self.assertEqual(order.fulfillment_status, "cancelled")
+                self.assertEqual(
+                    await session.scalar(
+                        select(func.count(StockMovement.id)).where(StockMovement.order_id == order.id, StockMovement.movement_type == "release")
+                    ),
+                    1,
+                )
+                self.assertEqual(await session.scalar(select(func.count(PaymentReconciliation.id)).where(PaymentReconciliation.order_id == order.id)), 1)
+                self.assertEqual((await session.scalar(select(InventoryBalance))).reserved, 0)
+
+        await race_expiry()
+        await race_cancel()
 
 
 if __name__ == "__main__":

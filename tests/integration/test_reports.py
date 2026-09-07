@@ -28,7 +28,7 @@ class ReportsPGTests(unittest.IsolatedAsyncioTestCase):
         async with self.engine.begin() as connection:
             await connection.execute(
                 text(
-                    "TRUNCATE fulfillment_transitions,payment_attempts,stock_movements,reservations,"
+                    "TRUNCATE payment_reconciliations,fulfillment_transitions,payment_attempts,stock_movements,reservations,"
                     "order_items,inventory_balances,products,outbox,idempotency_keys,orders,users RESTART IDENTITY CASCADE"
                 )
             )
@@ -36,9 +36,10 @@ class ReportsPGTests(unittest.IsolatedAsyncioTestCase):
 
         async with self.sf() as session:
             user = User(username="reports-owner", password_hash="x", role="owner", is_active=True, token_version=0)
-            session.add(user)
+            seller = User(username="reports-seller", password_hash="x", role="seller", is_active=True, token_version=0)
+            session.add_all([user, seller])
             await session.commit()
-            self.owner_id = user.id
+            self.owner_id, self.seller_id = user.id, seller.id
 
     async def asyncTearDown(self) -> None:
         await self.engine.dispose()
@@ -51,18 +52,25 @@ class ReportsPGTests(unittest.IsolatedAsyncioTestCase):
         async with self.sf() as session:
             rows = []
             fixtures = (
-                ("=2+2", 100, "confirmed", "paid", False),
-                ("safe", 200, "shipped", "paid", False),
+                (" =2+2", 100, "confirmed", "paid", False, self.owner_id, base),
+                (" +SUM(A1)", 110, "confirmed", "paid", False, self.owner_id, base + timedelta(hours=1)),
+                (" -10", 120, "shipped", "paid", False, self.owner_id, base + timedelta(hours=2)),
+                (" @cmd", 130, "confirmed", "paid", False, self.seller_id, base + timedelta(hours=3)),
+                ("safe", 200, "shipped", "paid", False, self.owner_id, base + timedelta(hours=4)),
                 ("unpaid", 400, "confirmed", "pending", False),
                 ("cancelled", 500, "cancelled", "paid", False),
                 ("expired", 600, "expired", "paid", False),
                 ("recon", 700, "confirmed", "paid", True),
+                ("at-end", 999, "confirmed", "paid", False, self.owner_id, base + timedelta(days=1)),
             )
-            for number, amount, state, payment, reconciliation in fixtures:
+            for index, fixture in enumerate(fixtures):
+                number, amount, state, payment, reconciliation, *extra = fixture
+                seller_id = extra[0] if extra else self.owner_id
+                created_at = extra[1] if len(extra) > 1 else base
                 rows.append(
                     Order(
                         public_id=number,
-                        created_by_id=self.owner_id,
+                        created_by_id=seller_id,
                         customer_name="c",
                         phone_raw="p",
                         phone_normalized=number,
@@ -76,8 +84,8 @@ class ReportsPGTests(unittest.IsolatedAsyncioTestCase):
                         currency="IRR",
                         notes=None,
                         photo_file_id="",
-                        draft_token=f"token-{number}",
-                        created_at=base,
+                        draft_token=f"token-{index}",
+                        created_at=created_at,
                         delivery_status="pending",
                         fulfillment_status=state,
                         payment_status=payment,
@@ -89,14 +97,26 @@ class ReportsPGTests(unittest.IsolatedAsyncioTestCase):
         async with self.sf() as session:
             service = ReportService(session)
             report = await service.revenue(start=base, end=base + timedelta(days=1), limit=1)
-            self.assertEqual((report["order_count"], report["revenue"]), (2, 300))
+            self.assertEqual((report["order_count"], report["revenue"]), (5, 660))
             self.assertEqual(len(report["items"]), 1)
+            first_id = report["items"][0].id
             page = await service.revenue(start=base, end=base + timedelta(days=1), limit=1, cursor=report["next_cursor"])
             self.assertEqual(len(page["items"]), 1)
+            self.assertEqual((page["order_count"], page["revenue"]), (5, 660))
+            self.assertGreater(page["items"][0].id, first_id)
+            status = await service.revenue(start=base, end=base + timedelta(days=1), status="confirmed", limit=100)
+            self.assertEqual((status["order_count"], status["revenue"]), (3, 340))
+            seller = await service.revenue(start=base, end=base + timedelta(days=1), seller_id=self.seller_id, limit=100)
+            self.assertEqual((seller["order_count"], seller["revenue"]), (1, 130))
+            self.assertEqual(seller["items"][0].created_by_id, self.seller_id)
+            all_rows = await service.revenue(start=base, end=base + timedelta(days=1), limit=100)
+            self.assertEqual([row.public_id for row in all_rows["items"]], [" =2+2", " +SUM(A1)", " -10", " @cmd", "safe"])
+            self.assertEqual(all_rows["items"][0].created_at, base)
+            self.assertNotIn("at-end", [row.public_id for row in all_rows["items"]])
             self.assertIsNone((await service.revenue(start=base + timedelta(days=1), end=base + timedelta(days=2)))["next_cursor"])
             body = await service.csv(start=base, end=base + timedelta(days=1))
-            self.assertIn("'=2+2", body)
-            self.assertNotIn("=2+2", body.replace("'=2+2", ""))
+            for formula in ("=2+2", "+SUM(A1)", "-10", "@cmd"):
+                self.assertIn("' " + formula, body)
 
 
 if __name__ == "__main__":
