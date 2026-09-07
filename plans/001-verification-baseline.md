@@ -6,7 +6,7 @@ Supervisor approval, 2026-09-05: reviewed commits 797f5cf, 85a9b45, 7d29078; ind
 
 ## Context and drift check
 
-Repository: D:/projects/onlineshop. Python aiogram polling bot, SQLite, unittest. Run `git diff --stat f8900a8..HEAD -- order_bot tests README.md requirements.txt Dockerfile compose.yaml` and `git diff -- order_bot tests`. Compare the following facts with current code before editing; stop on unexplained changes.
+Repository root. Python aiogram polling bot, SQLite, unittest. Run `git diff --stat f8900a8..HEAD -- order_bot tests README.md requirements.txt Dockerfile compose.yaml` and `git diff -- order_bot tests`. Compare the following facts with current code before editing; stop on unexplained changes.
 
 - `order_bot/database.py:8`: `from datetime import UTC, datetime, timedelta`.
 - `order_bot/validation.py:46`: `re.fullmatch(r"09\d{9}", value)`; Persian/Arabic digits are translated but other decimal scripts remain unchanged.

@@ -28,7 +28,7 @@ The seed command is restricted to `localhost` and the named `*_test` databases. 
 
 ## Architecture
 
-FastAPI (`backend/api`) authenticates requests and maps role permissions to shared order, fulfillment, and report services (`backend/services`). SQLAlchemy models and Alembic migrations define PostgreSQL state. Order creation computes totals from catalog prices, locks products in SKU order, reserves stock, snapshots invoice lines, records idempotency, and inserts an outbox row in one transaction. Fulfillment transitions are audited in the same transaction and revenue reports aggregate paid, non cancelled, non expired orders. A delivery worker can claim outbox rows with leases and bounded retries; the Telegram adapter remains a separate integration boundary.
+FastAPI (`backend/api`) authenticates requests and maps role permissions to shared order, fulfillment, report, payment, and delivery services (`backend/services`). SQLAlchemy models and Alembic migrations define PostgreSQL state. Order creation computes totals from catalog prices, locks products in SKU order, reserves stock, snapshots invoice lines, records idempotency, and inserts an outbox row in one transaction. Fulfillment transitions are audited in the same transaction and revenue reports aggregate paid, non cancelled, non expired orders. The delivery worker claims outbox rows with leases and bounded retries, while the fake payment callback verifies signed raw bytes and deduplicates provider events.
 
 ```mermaid
 flowchart LR
@@ -77,6 +77,8 @@ Invoke-RestMethod http://127.0.0.1:8000/api/v1/commerce/orders -Method Post -Hea
 
 Warehouse and manager users can inspect and transition fulfillment through `GET/PATCH /api/v1/orders/{public_id}/fulfillment`; owners and managers can query `/api/v1/reports/revenue` or download its CSV form. Both surfaces use bounded inputs and role checks.
 
+The local payment sandbox is `POST /api/v1/payments/fake/callback`. Sign the exact request bytes with the HMAC protocol in [`docs/fake-payment-and-worker.md`](docs/fake-payment-and-worker.md); duplicate event delivery is idempotent and mismatched amount, currency, signature, or transaction binding is rejected. The delivery worker is runnable with an injected transport using `python -m backend.delivery_worker --transport module:function`; transport failures are persisted for bounded retry or explicit reconciliation.
+
 ## Guarantees and security boundaries
 
 Orders, item snapshots, reservations, idempotency records, stock movements, and outbox insertion commit or roll back together. Duplicate idempotency keys replay the original order only when their canonical payload matches; a different payload conflicts. Inventory reservations lock all products in deterministic order and enforce non negative database constraints. Seller responses omit customer PII and manager/warehouse access follows the route permission matrix in [`docs/api/permissions.md`](docs/api/permissions.md). Currency is explicit integer IRR in the current catalog flow.
@@ -85,7 +87,7 @@ Backups contain personal data and must be access controlled. The backup and rest
 
 ## Demo and evidence
 
-Run the deterministic five minute walkthrough in [`docs/demo.md`](docs/demo.md). It covers authentication, API order creation, a final stock race, delivery failure/retry when the worker is available, and webhook replay when a payment route is available. Unavailable optional integrations are reported as skipped and called out as follow up work.
+Run the deterministic five minute walkthrough in [`docs/demo.md`](docs/demo.md). It covers authentication, API order creation, a final stock race, a real delivery worker failure/retry, signed fake payment, webhook replay, fulfillment, and revenue reporting.
 
 The benchmark is intentionally modest and reproducible. Start the API with the synthetic seed, then run:
 
@@ -108,8 +110,8 @@ mypy order_bot backend
 python -m pip check
 ```
 
-The PostgreSQL integration tests refuse non local databases and names that do not end in `_test`; restore uses `RESTORE_DATABASE_URL` when supplied or derives a separate `_restore_test` target. Without `TEST_DATABASE_URL`, they skip rather than connect to a default database.
+The PostgreSQL integration tests refuse non local databases and names that do not end in `_test`; restore uses `RESTORE_DATABASE_URL` when supplied or derives a separate `_restore_test` target. Set `TEST_DATABASE_URL` to a disposable local `_test` database before running the integration suite.
 
 ## Decisions and limitations
 
-The concise architecture decisions are [`docs/adr/001-shared-backend.md`](docs/adr/001-shared-backend.md), [`docs/adr/002-transactions-and-delivery.md`](docs/adr/002-transactions-and-delivery.md), and [`docs/adr/003-operational-evidence.md`](docs/adr/003-operational-evidence.md). Real charges, refunds, production deployment, multi store tenancy, and a broker are outside this slice. Delivery and payment demos detect their routes and show a clear skip until those integrations are added.
+The concise architecture decisions are [`docs/adr/001-shared-backend.md`](docs/adr/001-shared-backend.md), [`docs/adr/002-transactions-and-delivery.md`](docs/adr/002-transactions-and-delivery.md), and [`docs/adr/003-operational-evidence.md`](docs/adr/003-operational-evidence.md). Real charges, refunds, production deployment, multi store tenancy, and a broker are outside this slice. The payment and delivery integrations are deterministic local boundaries: the payment gateway is fake and signed, and the worker transport is injected so tests and demos never contact a real provider.

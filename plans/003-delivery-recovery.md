@@ -1,10 +1,10 @@
 # Plan 003: Make persisted orders recoverable when UI or delivery fails
 
-Status TODO. Priority P1. Effort M. Risk MED. Category reliability. Planned at f8900a8, 2026-09-04. Depends on 001 and 002.
+Status DONE. Priority P1. Effort M. Risk MED. Category reliability. Planned at f8900a8, 2026-09-04. Depends on 001 and 002. Commit `b8a60ec` adds best-effort acknowledgement, owner-scoped recovery, restart persistence, explicit ambiguous reconciliation, and fenced concurrent/partial retries; the recorded 69-test gate, Ruff, mypy, and pip check passed.
 
 ## Context and drift check
 
-Repo D:/projects/onlineshop; aiogram polling, one SQLite instance, authorized sellers only. Run `git diff --stat f8900a8..HEAD -- order_bot/bot.py order_bot/database.py tests`. Account for prerequisite callback/FSM fixes before proceeding.
+Repository root; aiogram polling, one SQLite instance, authorized sellers only. Run `git diff --stat f8900a8..HEAD -- order_bot/bot.py order_bot/database.py tests`. Account for prerequisite callback/FSM fixes before proceeding.
 
 At audit, order_bot/bot.py:416 saves an order; :442 awaits callback.answer before :443 publish_order. A failed callback acknowledgment leaves a durable pending row without publication. Existing-row handling at :432-440 clears state and offers retry only for failed. database.py:222 recovery changes only sending to failed. No user-facing pending/failed listing exists.
 

@@ -4,10 +4,11 @@ import os
 import subprocess
 import sys
 import unittest
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 import httpx
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -73,7 +74,81 @@ class DemoSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(created.status_code, 200, created.text)
         order_id = created.json()["public_id"]
         self.assertEqual((await self.client.get(f"/api/v1/orders/{order_id}", headers=headers)).status_code, 200)
-        metrics = await self.client.get("/metrics")
+        # Operational data is protected even though liveness/readiness remain
+        # public. Check both anonymous and authenticated role boundaries.
+        self.assertEqual((await self.client.get("/metrics")).status_code, 401)
+        owner_token = await self.client.post(
+            "/api/v1/auth/token",
+            data={"username": "portfolio-owner", "password": "portfolio-test-password"},
+        )
+        self.assertEqual(owner_token.status_code, 200)
+        owner_headers = {"Authorization": f"Bearer {owner_token.json()['access_token']}"}
+        self.assertEqual((await self.client.get("/metrics", headers=headers)).status_code, 403)
+        owner_order = await self.client.get(f"/api/v1/orders/{order_id}", headers=owner_headers)
+        self.assertEqual(owner_order.status_code, 200)
+        order_amount = owner_order.json()["amount"]
+
+        # Exercise the real outbox worker with a deterministic transport fault,
+        # then make the retry due and recover it with the same worker.
+        from backend.models import Order, Outbox
+        from backend.services.delivery import DeliveryWorker, TransientDeliveryError
+
+        class DemoTransport:
+            def __init__(self) -> None:
+                self.failed = False
+                self.photos = 0
+                self.texts = 0
+
+            async def send_photo(self, order) -> int:
+                self.photos += 1
+                return 900 + self.photos
+
+            async def send_text(self, order, photo_message_id: int) -> int:
+                self.texts += 1
+                if not self.failed:
+                    self.failed = True
+                    raise TransientDeliveryError("injected demo failure", retry_after=0)
+                return 950 + self.texts
+
+        transport = DemoTransport()
+        worker = DeliveryWorker(self.sf, transport, worker_id="demo-smoke-worker")
+        self.assertTrue(await worker.run_once())
+        self.assertEqual((transport.photos, transport.texts), (1, 1))
+        async with self.sf() as session:
+            order = await session.scalar(select(Order).where(Order.public_id == order_id))
+            outbox = await session.scalar(select(Outbox).where(Outbox.order_id == order.id))
+            self.assertIsNotNone(outbox)
+            self.assertEqual(outbox.status, "pending")
+            self.assertEqual(outbox.error_code, "transient")
+            self.assertIsNotNone(outbox.next_attempt_at)
+            outbox.next_attempt_at = datetime.now(UTC)
+            await session.commit()
+        self.assertTrue(await worker.run_once())
+        async with self.sf() as session:
+            order = await session.scalar(select(Order).where(Order.public_id == order_id))
+            outbox = await session.scalar(select(Outbox).where(Outbox.order_id == order.id))
+            self.assertEqual(outbox.status, "sent")
+
+        # The signed fake callback is verified over the exact bytes and replay
+        # is accepted without a second payment effect.
+        from backend.services.payments import FakeGateway
+
+        raw = FakeGateway.payload(
+            order_id=order_id,
+            amount=order_amount,
+            provider_transaction_id="demo-transaction-001",
+            provider_event_id="demo-event-001",
+        )
+        with patch.dict(os.environ, {"FAKE_PAYMENT_HMAC_SECRET": "demo-local-secret"}):
+            payment_headers = {"X-Fake-Gateway-Signature": FakeGateway.sign(raw, "demo-local-secret")}
+            paid = await self.client.post("/api/v1/payments/fake/callback", content=raw, headers=payment_headers)
+            replay = await self.client.post("/api/v1/payments/fake/callback", content=raw, headers=payment_headers)
+        self.assertEqual(paid.status_code, 200, paid.text)
+        self.assertTrue(paid.json()["applied"])
+        self.assertEqual(replay.status_code, 200, replay.text)
+        self.assertFalse(replay.json()["applied"])
+
+        metrics = await self.client.get("/metrics", headers=owner_headers)
         self.assertEqual(metrics.status_code, 200)
         body = metrics.json()
         self.assertIn("http", body)
