@@ -108,7 +108,7 @@ Redis فقط هنگام افزودن FSM با TTL یا cache اندازه‌گی
 | [002 — صحت پیش‌نمایش و تأیید](002-draft-integrity.md) | DONE — 44 تست و CI موفق در 066f16d | 001 |
 | [003 — بازیابی delivery](003-delivery-recovery.md) | DONE — 69 تست bot و مسیرهای restart/concurrency موفق | 001 و 002 |
 | [004 — بک‌اند API و PostgreSQL](004-backend-foundation.md) | DONE — API، importer، اتصال PostgreSQL ربات، deployment و CI تأیید شد | 001، 002، 003 |
-| [005 — تجارت، عملیات و خروجی رزومه](005-commerce-and-portfolio.md) | DONE — کاتالوگ، رزرو، پرداخت جعلی امضاشده، worker تحویل، fulfillment، گزارش‌ها و شواهد عملیاتی با گیت‌های محلی ثبت‌شده تکمیل شده‌اند؛ CI نهایی پس از ادغام supervisor باقی است | 004 |
+| [005 — تجارت، عملیات و خروجی رزومه](005-commerce-and-portfolio.md) | DONE — کاتالوگ، رزرو، پرداخت جعلی امضاشده، worker تحویل، fulfillment، گزارش‌ها و شواهد عملیاتی تکمیل شده‌اند؛ CI موفق [34134913816](https://github.com/afshinheydarali/onlinesdhop/actions/runs/34134913816) روی Python 3.11/3.12 با 136 تست و zero-skip ثبت شده است | 004 |
 
 ## چیزی که در رزومه نشان بدهید
 
