@@ -46,8 +46,9 @@ class DemoSmokeTests(unittest.IsolatedAsyncioTestCase):
         await self.engine.dispose()
 
     async def test_api_demo_flow_and_safe_observability(self) -> None:
-        live = await self.client.get("/health/live")
+        live = await self.client.get("/health/live", headers={"X-Request-ID": "demo-correlation-001"})
         self.assertEqual(live.status_code, 200)
+        self.assertEqual(live.headers.get("X-Request-ID"), "demo-correlation-001")
         self.assertEqual((await self.client.get("/health/ready")).status_code, 200)
         token = await self.client.post("/api/v1/auth/token", data={"username": "portfolio-seller", "password": "portfolio-test-password"})
         self.assertEqual(token.status_code, 200)
