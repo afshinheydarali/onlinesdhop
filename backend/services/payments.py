@@ -13,13 +13,13 @@ import json
 import os
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.models import InventoryBalance, Order, PaymentAttempt, PaymentEvent, Reservation, StockMovement
+from backend.models import FulfillmentTransition, Order, PaymentAttempt, PaymentEvent, Reservation
+from backend.services.fulfillment import FulfillmentService
 
 
 class PaymentError(ValueError):
@@ -123,46 +123,6 @@ class PaymentService:
             secret = secret.encode("utf-8")
         self.secret = secret
 
-    async def _release_reserved(
-        self, order: Order, reservations: list[Reservation], *, status: str, at: datetime
-    ) -> None:
-        """Release this order's remaining reservation while holding its row lock.
-
-        Payment, cancellation and expiry all acquire the order row first.  The
-        reservation and balance rows are then locked in product order so a late
-        callback cannot leave reserved stock behind or deadlock with fulfillment.
-        """
-        active = [r for r in reservations if r.status == "reserved"]
-        product_ids = sorted({r.product_id for r in active})
-        if not product_ids:
-            return
-        balances = {
-            balance.product_id: balance
-            for balance in (
-                await self.session.scalars(
-                    select(InventoryBalance)
-                    .where(InventoryBalance.product_id.in_(product_ids))
-                    .order_by(InventoryBalance.product_id)
-                    .with_for_update()
-                )
-            ).all()
-        }
-        for reservation in active:
-            balance = balances.get(reservation.product_id)
-            if balance is None or balance.reserved < reservation.quantity:
-                raise RuntimeError("reservation invariant violated")
-            balance.reserved -= reservation.quantity
-            reservation.status = status
-            self.session.add(
-                StockMovement(
-                    product_id=reservation.product_id,
-                    order_id=order.id,
-                    quantity=reservation.quantity,
-                    movement_type="release",
-                    created_at=at,
-                )
-            )
-
     async def apply_callback(self, raw_body: bytes, signature: str) -> PaymentResult:
         secret = self.secret if self.secret is not None else payment_hmac_secret()
         try:
@@ -178,15 +138,21 @@ class PaymentService:
 
         # This lock only serializes callbacks for the same provider event. The
         # order row lock below serializes payment versus expiry/cancellation.
-        event_key = int.from_bytes(hashlib.blake2b(event_id.encode(), digest_size=8).digest(), "big", signed=True)
+        provider = "fake"
+        event_key = int.from_bytes(hashlib.blake2b(f"{provider}\0{event_id}".encode(), digest_size=8).digest(), "big", signed=True)
         await self.session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": event_key})
         tx_key = int.from_bytes(
-            hashlib.blake2b(payload["provider_transaction_id"].encode(), digest_size=8).digest(),
+            hashlib.blake2b(f"{provider}\0{payload['provider_transaction_id']}".encode(), digest_size=8).digest(),
             "big",
             signed=True,
         )
         await self.session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": tx_key})
-        existing = await self.session.scalar(select(PaymentEvent).where(PaymentEvent.provider_event_id == event_id))
+        existing = await self.session.scalar(
+            select(PaymentEvent).where(
+                PaymentEvent.provider == provider,
+                PaymentEvent.provider_event_id == event_id,
+            )
+        )
         if existing is not None:
             if existing.payload_fingerprint != fingerprint:
                 raise PaymentConflict("provider event replay has changed content")
@@ -208,15 +174,20 @@ class PaymentService:
 
         transaction_id = payload["provider_transaction_id"]
         attempt = await self.session.scalar(
-            select(PaymentAttempt).where(PaymentAttempt.provider_transaction_id == transaction_id).with_for_update()
+            select(PaymentAttempt)
+            .where(
+                PaymentAttempt.provider == provider,
+                PaymentAttempt.provider_transaction_id == transaction_id,
+            )
+            .with_for_update()
         )
         if attempt is not None:
             if attempt.order_id != order.id:
                 raise PaymentConflict("provider transaction is bound to another order")
             self.session.add(PaymentEvent(
-                provider_event_id=event_id, payload_fingerprint=fingerprint,
-                provider_transaction_id=transaction_id, order_id=order.id,
-                payment_attempt_id=attempt.id, received_at=datetime.now(UTC),
+                provider=provider, provider_event_id=event_id,
+                payload_fingerprint=fingerprint, provider_transaction_id=transaction_id,
+                order_id=order.id, payment_attempt_id=attempt.id,
             ))
             await self.session.commit()
             return PaymentResult(event_id, order.id, "duplicate", False)
@@ -239,13 +210,6 @@ class PaymentService:
         )
         if order.fulfillment_status in {"cancelled", "expired"}:
             late_reason = "order_" + order.fulfillment_status
-        elif order.expires_at is not None and order.expires_at <= now:
-            # Expiry wins while holding the same order lock used by the expiry
-            # process. Keep the order's existing lifecycle state intact and
-            # make the late-money decision visible to reconciliation.
-            late_reason = "reservation_expired_before_payment"
-            if order.fulfillment_status in {"draft", "confirmed"}:
-                order.fulfillment_status = "expired"
         elif any(
             reservation.status in {"released", "expired"}
             or (reservation.expires_at is not None and reservation.expires_at <= now)
@@ -253,34 +217,58 @@ class PaymentService:
         ):
             late_reason = "reservation_expired_before_payment"
             if order.fulfillment_status in {"draft", "confirmed"}:
+                old_status = order.fulfillment_status
                 order.fulfillment_status = "expired"
+                self.session.add(
+                    FulfillmentTransition(
+                        order_id=order.id,
+                        actor_id=None,
+                        actor_role="payment",
+                        from_status=old_status,
+                        to_status="expired",
+                        reason="verified payment arrived after reservation expiry",
+                        transitioned_at=now,
+                    )
+                )
 
         if late_reason:
-            release_status = "expired" if "expired" in late_reason else "released"
-            await self._release_reserved(order, reservations, status=release_status, at=now)
+            await FulfillmentService(self.session)._release_locked(
+                order,
+                status="expired" if "expired" in late_reason else "released",
+                at=now,
+            )
             order.reconciliation_required = True
-            if release_status == "expired":
+            if "expired" in late_reason:
                 order.expired_at = now
 
         status = "reconciliation" if late_reason else ("paid" if payload["status"] == "success" else "failed")
         attempt = PaymentAttempt(
-            order_id=order.id, provider="fake", provider_transaction_id=transaction_id,
+            order_id=order.id, provider=provider, provider_transaction_id=transaction_id,
+            provider_event_id=event_id,
             amount=payload["amount"], currency=expected_currency, status=status,
-            reconciliation_reason=late_reason, created_at=now,
-            paid_at=now if status == "paid" else None,
+            payload_fingerprint=fingerprint, created_at=now,
         )
         self.session.add(attempt)
         await self.session.flush()
         self.session.add(PaymentEvent(
-            provider_event_id=event_id, payload_fingerprint=fingerprint,
+            provider=provider, provider_event_id=event_id, payload_fingerprint=fingerprint,
             provider_transaction_id=transaction_id, order_id=order.id,
-            payment_attempt_id=attempt.id, received_at=now,
+            payment_attempt_id=attempt.id,
         ))
         if late_reason:
             # Reconciliation is orthogonal to the provider's verified payment
             # state.  Keep the order vocabulary compatible with fulfillment.
             order.reconciliation_required = True
             order.payment_status = "paid" if payload["status"] == "success" else "failed"
+            await FulfillmentService(self.session)._record_reconciliation(
+                order,
+                kind="late_payment",
+                reason=f"verified payment arrived after order {order.fulfillment_status}",
+                at=now,
+                amount=payload["amount"],
+                currency=expected_currency,
+                payment_attempt_id=attempt.id,
+            )
         elif status == "paid":
             order.payment_status = "paid"
         else:

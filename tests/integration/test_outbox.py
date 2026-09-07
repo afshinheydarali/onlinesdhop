@@ -51,7 +51,9 @@ class OutboxPostgresTests(unittest.IsolatedAsyncioTestCase):
         self.engine = create_async_engine(guarded_url(DB), poolclass=NullPool)
         async with self.engine.begin() as connection:
             await connection.execute(text(
-                "TRUNCATE TABLE payment_events, payment_attempts, outbox, idempotency_keys, orders, admins, users RESTART IDENTITY CASCADE"
+                "TRUNCATE TABLE payment_events, payment_reconciliations, payment_attempts, "
+                "fulfillment_transitions, outbox, idempotency_keys, orders, admins, users "
+                "RESTART IDENTITY CASCADE"
             ))
         self.sf = async_sessionmaker(self.engine, expire_on_commit=False)
         from backend.models import Order, Outbox

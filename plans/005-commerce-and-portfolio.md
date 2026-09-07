@@ -1,6 +1,6 @@
 # Plan 005: Build the commerce capabilities and evidence that make the portfolio credible
 
-Status TODO. Priority P2, optional extensions P3. Effort L (roughly 6-9 weeks part-time after foundation). Risk HIGH for stock/payment correctness. Category product direction/operations. Planned at f8900a8, 2026-09-04. Depends on 004. This is a sequence of small design-and-build slices; do not implement every optional feature at once.
+Status IN PROGRESS. Priority P2, optional extensions P3. Effort L (roughly 6-9 weeks part-time after foundation). Risk HIGH for stock/payment correctness. Category product direction/operations. Planned at f8900a8, 2026-09-04. Depends on 004. Slice 1 is implemented and verified; Slices 2-4 remain under supervised review.
 
 ## Context and prerequisite contract
 

@@ -72,12 +72,10 @@ class Order(Base):
     channel_photo_message_id: Mapped[int | None] = mapped_column(BigInteger)
     channel_text_message_id: Mapped[int | None] = mapped_column(BigInteger)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    # Lifecycle fields are additive to the legacy free-text order shape.
-    payment_status: Mapped[str] = mapped_column(String(24), default="pending")
-    fulfillment_status: Mapped[str] = mapped_column(String(24), default="confirmed")
-    reconciliation_required: Mapped[bool] = mapped_column(Boolean, default=False)
+    fulfillment_status: Mapped[str] = mapped_column(String(20), default="draft", server_default="draft")
+    payment_status: Mapped[str] = mapped_column(String(20), default="pending", server_default="pending")
+    reconciliation_required: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     expired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
         CheckConstraint("quantity > 0", name="ck_orders_quantity_positive"),
         CheckConstraint("amount IS NULL OR amount >= 0", name="ck_orders_amount_nonnegative"),
@@ -86,12 +84,12 @@ class Order(Base):
             name="ck_orders_delivery_status",
         ),
         CheckConstraint(
-            "payment_status IN ('pending','paid','failed','refunded')",
-            name="ck_orders_payment_status",
-        ),
-        CheckConstraint(
             "fulfillment_status IN ('draft','confirmed','packing','shipped','delivered','cancelled','expired')",
             name="ck_orders_fulfillment_status",
+        ),
+        CheckConstraint(
+            "payment_status IN ('pending','paid','failed','refunded')",
+            name="ck_orders_payment_status",
         ),
         Index(
             "ix_orders_duplicate",
@@ -99,6 +97,8 @@ class Order(Base):
             "product_normalized",
             "created_at",
         ),
+        Index("ix_orders_fulfillment_status_created", "fulfillment_status", "created_at", "id"),
+        Index("ix_orders_payment_report", "payment_status", "reconciliation_required", "created_at", "id"),
     )
 
 
@@ -124,48 +124,6 @@ class Outbox(Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_code: Mapped[str | None] = mapped_column(String(120))
-
-
-class PaymentAttempt(Base):
-    """A provider transaction and its locally verified outcome."""
-
-    __tablename__ = "payment_attempts"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    order_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("orders.id"), index=True)
-    provider: Mapped[str] = mapped_column(String(40), default="fake")
-    provider_transaction_id: Mapped[str] = mapped_column(String(160), unique=True)
-    amount: Mapped[int] = mapped_column(BigInteger)
-    currency: Mapped[str] = mapped_column(String(3))
-    status: Mapped[str] = mapped_column(String(24), default="pending")
-    reconciliation_reason: Mapped[str | None] = mapped_column(String(240))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    __table_args__ = (
-        CheckConstraint("amount >= 0", name="ck_payment_attempt_amount_nonnegative"),
-        CheckConstraint(
-            "status IN ('pending','paid','failed','reconciliation')",
-            name="ck_payment_attempt_status",
-        ),
-    )
-
-
-class PaymentEvent(Base):
-    """Immutable provider callback receipt used for event and payload replay fencing."""
-
-    __tablename__ = "payment_events"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    provider_event_id: Mapped[str] = mapped_column(String(160), unique=True)
-    payload_fingerprint: Mapped[str] = mapped_column(String(64))
-    provider_transaction_id: Mapped[str] = mapped_column(String(160), index=True)
-    order_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("orders.id"))
-    payment_attempt_id: Mapped[int | None] = mapped_column(
-        BigInteger, ForeignKey("payment_attempts.id")
-    )
-    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-
-
-# Domain vocabulary used by some adapters and reports.
-PaymentWebhookEvent = PaymentEvent
 
 
 class Product(Base):
@@ -222,6 +180,84 @@ class Reservation(Base):
         CheckConstraint("status IN ('reserved','released','consumed','expired')", name="ck_reservations_status"),
         UniqueConstraint("order_id", "product_id", name="uq_reservation_order_product"),
     )
+
+
+class FulfillmentTransition(Base):
+    __tablename__ = "fulfillment_transitions"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    order_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("orders.id", ondelete="CASCADE"))
+    actor_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=True)
+    actor_role: Mapped[str] = mapped_column(String(20))
+    from_status: Mapped[str] = mapped_column(String(20))
+    to_status: Mapped[str] = mapped_column(String(20))
+    reason: Mapped[str] = mapped_column(Text)
+    transitioned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (Index("ix_fulfillment_transitions_order_time", "order_id", "transitioned_at", "id"),)
+
+
+class PaymentAttempt(Base):
+    __tablename__ = "payment_attempts"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    order_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("orders.id", ondelete="CASCADE"))
+    provider: Mapped[str] = mapped_column(String(40), default="fake")
+    provider_transaction_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    provider_event_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    amount: Mapped[int] = mapped_column(BigInteger)
+    currency: Mapped[str] = mapped_column(String(3))
+    status: Mapped[str] = mapped_column(String(20))
+    payload_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_event_id", name="uq_payment_provider_event"),
+        UniqueConstraint("provider", "provider_transaction_id", name="uq_payment_provider_transaction"),
+        Index("ix_payment_attempts_order", "order_id", "created_at"),
+    )
+
+
+class PaymentReconciliation(Base):
+    """Durable manual follow-up for money that cannot be settled automatically."""
+
+    __tablename__ = "payment_reconciliations"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    order_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("orders.id", ondelete="CASCADE"))
+    payment_attempt_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("payment_attempts.id", ondelete="SET NULL"), nullable=True)
+    kind: Mapped[str] = mapped_column(String(40))
+    reason: Mapped[str] = mapped_column(Text)
+    amount: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    currency: Mapped[str | None] = mapped_column(String(3), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="open", server_default="open")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (
+        UniqueConstraint("order_id", "kind", name="uq_payment_reconciliation_order_kind"),
+        CheckConstraint("status IN ('open','resolved')", name="ck_payment_reconciliation_status"),
+        Index("ix_payment_reconciliations_order", "order_id", "created_at", "id"),
+    )
+
+
+class PaymentEvent(Base):
+    """Immutable signed provider callback receipt and replay fingerprint."""
+
+    __tablename__ = "payment_events"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    provider: Mapped[str] = mapped_column(String(40), default="fake")
+    provider_event_id: Mapped[str] = mapped_column(String(200))
+    provider_transaction_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    order_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("orders.id", ondelete="SET NULL"), nullable=True
+    )
+    payment_attempt_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("payment_attempts.id", ondelete="SET NULL"), nullable=True
+    )
+    payload_fingerprint: Mapped[str] = mapped_column(String(64))
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_event_id", name="uq_payment_event_provider_event"),
+        Index("ix_payment_events_provider_transaction", "provider", "provider_transaction_id"),
+    )
+
+
+# Compatibility name used by older adapters.
+PaymentWebhookEvent = PaymentEvent
 
 
 class StockMovement(Base):

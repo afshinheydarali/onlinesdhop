@@ -340,7 +340,17 @@ class OrderService:
                     line_total=line_total,
                 )
             )
-            self.session.add(Reservation(order_id=order.id, product_id=product.id, quantity=quantity, status="reserved"))
+            self.session.add(
+                Reservation(
+                    order_id=order.id,
+                    product_id=product.id,
+                    quantity=quantity,
+                    status="reserved",
+                    # Payment/reservation expiry is deliberately persisted so
+                    # expiry workers and payment callbacks share one policy.
+                    expires_at=now + timedelta(hours=24),
+                )
+            )
             self.session.add(StockMovement(product_id=product.id, order_id=order.id, quantity=quantity, movement_type="reserve"))
         self.session.add(Outbox(order_id=order.id, status="pending", attempts=0, next_attempt_at=now))
         try:

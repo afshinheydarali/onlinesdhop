@@ -31,8 +31,9 @@ class PaymentPostgresTests(unittest.IsolatedAsyncioTestCase):
         self.engine = create_async_engine(guarded_url(DB), poolclass=NullPool)
         async with self.engine.begin() as connection:
             await connection.execute(text(
-                "TRUNCATE TABLE payment_events, payment_attempts, stock_movements, reservations, "
-                "inventory_balances, products, outbox, idempotency_keys, orders, admins, users "
+                "TRUNCATE TABLE payment_events, payment_reconciliations, payment_attempts, "
+                "fulfillment_transitions, stock_movements, reservations, inventory_balances, products, "
+                "outbox, idempotency_keys, orders, admins, users "
                 "RESTART IDENTITY CASCADE"
             ))
         self.sf = async_sessionmaker(self.engine, expire_on_commit=False)
@@ -115,10 +116,10 @@ class PaymentPostgresTests(unittest.IsolatedAsyncioTestCase):
         from backend.services.payments import FakeGateway, InvalidPaymentSignature, PaymentError, PaymentService
 
         async def counts(session):
-            return tuple(
-                await session.scalar(select(func.count()).select_from(table))
-                for table in (Order, PaymentAttempt, PaymentEvent)
-            )
+            values = []
+            for table in (Order, PaymentAttempt, PaymentEvent):
+                values.append(await session.scalar(select(func.count()).select_from(table)))
+            return tuple(values)
 
         async with self.sf() as session:
             before = await counts(session)
@@ -228,12 +229,11 @@ class PaymentPostgresTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status_code, 200)
 
     async def test_late_payment_is_reconciliation_and_order_stays_expired(self) -> None:
-        from backend.models import InventoryBalance, Order, Reservation, StockMovement
+        from backend.models import InventoryBalance, Order, PaymentReconciliation, Reservation, StockMovement
         from backend.services.payments import FakeGateway, PaymentService
 
         async with self.sf() as session:
             order = await session.scalar(select(Order).where(Order.public_id == "ORD-PAYMENT-1"))
-            order.expires_at = datetime.now(UTC) - timedelta(seconds=1)
             await session.commit()
         await self.add_reservation(expires_at=datetime.now(UTC) - timedelta(seconds=1))
         raw = self.raw(event="late-event", tx="late-transaction")
@@ -252,6 +252,8 @@ class PaymentPostgresTests(unittest.IsolatedAsyncioTestCase):
                 await session.scalar(select(func.count()).select_from(StockMovement).where(StockMovement.movement_type == "release")),
                 1,
             )
+            reconciliation = await session.scalar(select(PaymentReconciliation).where(PaymentReconciliation.order_id == order.id))
+            self.assertEqual((reconciliation.kind, reconciliation.status), ("late_payment", "open"))
 
     async def test_payment_vs_expiry_order_lock_makes_late_money_reconciliation(self) -> None:
         from backend.models import InventoryBalance, Order, Reservation
@@ -293,7 +295,7 @@ class PaymentPostgresTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((balance.reserved, reservation.status), (0, "expired"))
 
     async def test_payment_vs_cancel_order_lock_never_revives_or_rereserves(self) -> None:
-        from backend.models import InventoryBalance, Order, Reservation, StockMovement
+        from backend.models import InventoryBalance, Order, StockMovement
         from backend.services.payments import FakeGateway, PaymentService
 
         cancel_has_lock = asyncio.Event()
@@ -304,20 +306,12 @@ class PaymentPostgresTests(unittest.IsolatedAsyncioTestCase):
         async def cancel_first() -> None:
             async with self.sf() as session:
                 order = await session.scalar(select(Order).where(Order.public_id == "ORD-PAYMENT-1").with_for_update())
-                reservations = list(
-                    (
-                        await session.scalars(
-                            select(Reservation)
-                            .where(Reservation.order_id == order.id)
-                            .order_by(Reservation.product_id)
-                            .with_for_update()
-                        )
-                    ).all()
-                )
-                service = PaymentService(session, secret=self.secret)
+                from backend.services.fulfillment import FulfillmentService
+
+                service = FulfillmentService(session)
                 cancel_has_lock.set()
                 await release_cancel.wait()
-                await service._release_reserved(order, reservations, status="released", at=datetime.now(UTC))
+                await service._release_locked(order, status="released", at=datetime.now(UTC))
                 order.fulfillment_status = "cancelled"
                 await session.commit()
 
