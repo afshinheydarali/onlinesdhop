@@ -118,6 +118,7 @@ class APIAuthTests(unittest.IsolatedAsyncioTestCase):
             ).status_code,
             401,
         )
+
         secret = os.environ["JWT_SECRET"]
         expired = jwt.encode(
             {
@@ -191,6 +192,66 @@ class APIAuthTests(unittest.IsolatedAsyncioTestCase):
             ).status_code,
             403,
         )
+
+    async def test_user_password_byte_limit_returns_422(self):
+        owner = await self.client.post(
+            "/api/v1/auth/token",
+            data={"username": "api-owner", "password": "correct horse battery staple"},
+        )
+        self.assertEqual(owner.status_code, 200)
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        response = await self.client.post(
+            "/api/v1/users",
+            json={
+                "username": "too-wide-password",
+                "password": "é" * 65,
+                "role": "seller",
+            },
+            headers=owner_headers,
+        )
+        self.assertEqual(response.status_code, 422)
+
+    async def test_token_rate_limit_uses_direct_ip_and_username(self):
+        from backend.auth import auth_rate_limiter
+
+        auth_rate_limiter.reset()
+        try:
+            for _ in range(4):
+                failed = await self.client.post(
+                    "/api/v1/auth/token",
+                    data={"username": "api-owner", "password": "wrong password"},
+                )
+                self.assertEqual(failed.status_code, 401)
+            blocked = await self.client.post(
+                "/api/v1/auth/token",
+                data={"username": "api-owner", "password": "wrong password"},
+                headers={"X-Forwarded-For": "203.0.113.9"},
+            )
+            self.assertEqual(blocked.status_code, 429)
+            self.assertIn("Retry-After", blocked.headers)
+            self.assertGreaterEqual(int(blocked.headers["Retry-After"]), 1)
+            self.assertEqual(
+                (
+                    await self.client.post(
+                        "/api/v1/auth/token",
+                        data={"username": "api-seller", "password": "correct horse battery staple"},
+                        headers={"X-Forwarded-For": "203.0.113.9"},
+                    )
+                ).status_code,
+                429,
+            )
+            auth_rate_limiter.reset()
+            self.assertEqual(
+                (
+                    await self.client.post(
+                        "/api/v1/auth/token",
+                        data={"username": "api-seller", "password": "correct horse battery staple"},
+                    )
+                ).status_code,
+                200,
+            )
+        finally:
+            auth_rate_limiter.reset()
 
     async def test_revocation_and_inactive_identity(self):
         token = await self.client.post(
