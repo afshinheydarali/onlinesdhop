@@ -6,7 +6,7 @@ import uuid
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -77,6 +77,7 @@ def _hash(command: CreateOrderCommand) -> str:
 
 
 class OrderService:
+    MAX_DELIVERY_ATTEMPTS = 5
     def __init__(self, session: AsyncSession, duplicate_window_days: int = 30):
         self.session = session
         self.duplicate_window_days = duplicate_window_days
@@ -383,8 +384,16 @@ class OrderService:
     async def claim_delivery(self, order_id: int, *, worker_id: str, lease_seconds: int = 300) -> Outbox | None:
         now = datetime.now(UTC)
         claim = uuid.uuid4().hex
-        row = await self.session.scalar(select(Outbox).where(Outbox.order_id == order_id).with_for_update(skip_locked=True))
-        if row is None or row.status in {"sent", "ambiguous", "failed"} or (row.lease_expires_at and row.lease_expires_at > now):
+        row = await self.session.scalar(
+            select(Outbox)
+            .where(Outbox.order_id == order_id)
+            .with_for_update(skip_locked=True)
+        )
+        if (
+            row is None
+            or row.status in {"sent", "ambiguous"}
+            or (row.lease_expires_at and row.lease_expires_at > now)
+        ):
             await self.session.rollback()
             return None
         if row.status == "sending" and row.lease_expires_at and row.lease_expires_at <= now:
@@ -401,7 +410,7 @@ class OrderService:
         if row.next_attempt_at and row.next_attempt_at > now:
             await self.session.rollback()
             return None
-        if row.attempts >= 5:
+        if row.attempts >= self.MAX_DELIVERY_ATTEMPTS:
             row.status = "failed"
             row.error_code = "attempt_limit"
             await self.session.commit()
@@ -414,6 +423,70 @@ class OrderService:
         await self.session.commit()
         return row
 
+    async def _locked_live_claim(self, order_id: int, claim_token: str) -> Outbox:
+        """Lock and validate a claim before finalizing a provider operation.
+
+        If the token's lease expired, persist an ambiguous state before
+        rejecting the stale worker. This closes the gap between a transport
+        timeout and the recovery worker's next claim.
+        """
+        row = await self.session.scalar(
+            select(Outbox)
+            .where(Outbox.order_id == order_id, Outbox.claim_token == claim_token)
+            .with_for_update()
+        )
+        if row is None or row.status != "sending":
+            raise ValueError("invalid delivery claim")
+        now = await self.session.scalar(select(func.now()))
+        if now is None:
+            raise RuntimeError("database clock unavailable")
+        if row.lease_expires_at is None or row.lease_expires_at <= now:
+            row.status = "ambiguous"
+            row.error_code = "lease_expired_manual_reconciliation"
+            row.lease_expires_at = None
+            order = await self.session.get(Order, order_id)
+            if order is not None:
+                order.delivery_status = "ambiguous"
+                order.delivery_error = row.error_code
+            await self.session.commit()
+            raise ValueError("delivery claim expired")
+        return row
+
+    async def mark_photo_sent(
+        self, order_id: int, claim_token: str, photo_message_id: int
+    ) -> None:
+        """Fence and persist the first Telegram operation before sending text."""
+        await self._locked_live_claim(order_id, claim_token)
+        order = await self.session.get(Order, order_id)
+        if order is None:
+            raise ValueError("order not found")
+        if order.channel_photo_message_id is None:
+            order.channel_photo_message_id = photo_message_id
+        await self.session.commit()
+
+    async def mark_delivery_ambiguous(
+        self, order_id: int, claim_token: str, error_code: str = "telegram_timeout"
+    ) -> None:
+        row = await self._locked_live_claim(order_id, claim_token)
+        row.status, row.error_code, row.lease_expires_at = "ambiguous", error_code[:120], None
+        order = await self.session.get(Order, order_id)
+        if order:
+            order.delivery_status, order.delivery_error = "ambiguous", error_code[:500]
+        await self.session.commit()
+
+    async def reconcile_ambiguous_delivery(self, order_id: int) -> None:
+        """Explicit operator action to make an ambiguous job retryable."""
+        row = await self.session.scalar(
+            select(Outbox).where(Outbox.order_id == order_id).with_for_update()
+        )
+        if row is None or row.status != "ambiguous":
+            raise ValueError("delivery is not ambiguous")
+        row.status, row.error_code, row.next_attempt_at = "pending", None, datetime.now(UTC)
+        order = await self.session.get(Order, order_id)
+        if order:
+            order.delivery_status, order.delivery_error = "pending", None
+        await self.session.commit()
+
     async def mark_delivery_sent(
         self,
         order_id: int,
@@ -421,9 +494,7 @@ class OrderService:
         photo_message_id: int,
         text_message_id: int | None = None,
     ) -> None:
-        row = await self.session.scalar(select(Outbox).where(Outbox.order_id == order_id, Outbox.claim_token == claim_token).with_for_update())
-        if row is None or row.status != "sending":
-            raise ValueError("invalid delivery claim")
+        row = await self._locked_live_claim(order_id, claim_token)
         row.status = "sent"
         order = await self.session.get(Order, order_id)
         if order:
@@ -444,9 +515,7 @@ class OrderService:
         *,
         retry_at: datetime | None = None,
     ) -> None:
-        row = await self.session.scalar(select(Outbox).where(Outbox.order_id == order_id, Outbox.claim_token == claim_token).with_for_update())
-        if row is None or row.status != "sending":
-            raise ValueError("invalid delivery claim")
+        row = await self._locked_live_claim(order_id, claim_token)
         row.status, row.error_code, row.lease_expires_at, row.next_attempt_at = (
             ("pending" if retry_at else "failed"),
             error_code[:120],
