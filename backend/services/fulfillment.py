@@ -91,6 +91,12 @@ class FulfillmentService:
         )
         if row is not None:
             return row
+        if payment_attempt_id is None:
+            payment_attempt_id = await self.session.scalar(
+                select(PaymentAttempt.id)
+                .where(PaymentAttempt.order_id == order.id, PaymentAttempt.status.in_(("succeeded", "paid")))
+                .order_by(PaymentAttempt.id.desc())
+            )
         row = PaymentReconciliation(
             order_id=order.id,
             payment_attempt_id=payment_attempt_id,

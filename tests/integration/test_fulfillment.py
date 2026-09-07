@@ -206,6 +206,7 @@ class FulfillmentPGTests(unittest.IsolatedAsyncioTestCase):
                 (reconciliation.kind, reconciliation.status, reconciliation.amount, reconciliation.currency),
                 ("refund_required", "open", order.amount, "IRR"),
             )
+            self.assertIsNotNone(reconciliation.payment_attempt_id)
             self.assertEqual(await session.scalar(select(func.count(PaymentReconciliation.id)).where(PaymentReconciliation.order_id == order.id)), 1)
 
     async def test_service_requires_active_actor_and_exact_role_for_expiry(self) -> None:
