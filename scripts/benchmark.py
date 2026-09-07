@@ -88,7 +88,7 @@ async def main() -> None:
         "measured_at": datetime.now(UTC).isoformat(),
         "machine": __import__("platform").platform(),
         "python": __import__("platform").python_version(),
-        "dataset": "seed_synthetic: 2 users, 1 admin, 3 products; no customer records before run",
+        "dataset": "seed_synthetic: 2 users, 2 admins, 3 products; no customer records before run",
         "request_mix": {"GET /api/v1/products": "70%", "POST /api/v1/orders": "30%"},
         "requested_requests": args.requests,
         "completed_requests": len(statuses),
