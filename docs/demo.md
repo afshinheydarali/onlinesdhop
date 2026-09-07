@@ -17,6 +17,6 @@ In a second terminal, run the smoke flow against PostgreSQL:
 python -m unittest tests.integration.test_demo_smoke -v
 ```
 
-For a live presentation, use the API examples in the README to show the request correlation header, catalog price derived server side, idempotent replay, and role filtered order output. Open `/health/ready` and `/metrics` to show dependency readiness and delivery backlog telemetry. `python scripts/benchmark.py --requests 100 --concurrency 4` provides a small measured baseline.
+For a live presentation, use the API examples in the README to show the request correlation header, catalog price derived server side, idempotent replay, and role filtered order output. Transition the order through `confirmed`, `packing`, `shipped`, and `delivered` with a warehouse token, then use an owner token to query `/api/v1/reports/revenue` (the synthetic order remains unpaid and therefore contributes zero revenue). Open `/health/ready` and `/metrics` to show dependency readiness and delivery backlog telemetry. `python scripts/benchmark.py --requests 100 --concurrency 4` provides a small measured baseline.
 
 The current repository does not expose a payment webhook route or a standalone worker HTTP route. The demo therefore labels payment replay and injected transport failure/recovery as skipped follow up steps rather than implying those integrations exist. Once those routes are added, extend this script with a deterministic fake transport failure, worker retry, and duplicate signed webhook request.

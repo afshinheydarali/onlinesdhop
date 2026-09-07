@@ -28,7 +28,7 @@ docker compose up --build
 
 ## Architecture
 
-FastAPI (`backend/api`) authenticates requests and maps role permissions to the shared `OrderService` (`backend/services`). SQLAlchemy models and Alembic migrations define PostgreSQL state. Order creation computes totals from catalog prices, locks products in SKU order, reserves stock, snapshots invoice lines, records idempotency, and inserts an outbox row in one transaction. A delivery worker can claim outbox rows with leases and bounded retries; the Telegram adapter remains a separate integration boundary.
+FastAPI (`backend/api`) authenticates requests and maps role permissions to shared order, fulfillment, and report services (`backend/services`). SQLAlchemy models and Alembic migrations define PostgreSQL state. Order creation computes totals from catalog prices, locks products in SKU order, reserves stock, snapshots invoice lines, records idempotency, and inserts an outbox row in one transaction. Fulfillment transitions are audited in the same transaction and revenue reports aggregate paid, non cancelled, non expired orders. A delivery worker can claim outbox rows with leases and bounded retries; the Telegram adapter remains a separate integration boundary.
 
 ```mermaid
 flowchart LR
@@ -74,6 +74,8 @@ Invoke-RestMethod http://127.0.0.1:8000/api/v1/commerce/orders -Method Post -Hea
 ```
 
 `GET /health/live` checks process liveness. `GET /health/ready` runs a database query and includes pool state. `GET /metrics` exposes bounded in process HTTP counters plus delivery backlog count, oldest pending age, retry count, and pool state. Logs are JSON metadata containing request and order IDs, method, route, status, and latency. Request bodies, authorization headers, tokens, phone numbers, addresses, and payment bodies are never logged.
+
+Warehouse and manager users can inspect and transition fulfillment through `GET/PATCH /api/v1/orders/{public_id}/fulfillment`; owners and managers can query `/api/v1/reports/revenue` or download its CSV form. Both surfaces use bounded inputs and role checks.
 
 ## Guarantees and security boundaries
 
